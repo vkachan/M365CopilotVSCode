@@ -59,23 +59,82 @@
 
 //#endregion
 //#region ../../packages/core/dist/jwt.js
-/**
-	* Decodifica el payload de un JWT sin validar la firma. Isomorfo: `atob` y
-	* `TextDecoder` existen tanto en el navegador como en Node 18+, así que sirve
-	* igual en el content script del navegador y en la extensión de VS Code.
+/** Un JWT de verdad no se acerca a esto; algo mayor no es un token. */
+	const MAX_JWT_CHARS = 8192;
+	/**
+	* Un JWE lleva la clave cifrada, el IV y el tag además del contenido: es más
+	* largo que el JWT equivalente, pero tampoco se acerca a esto.
 	*/
-	function decodeJwtPayload(token) {
+	const MAX_JWE_CHARS = 16384;
+	const SEGMENT = /^[A-Za-z0-9_-]*$/;
+	/**
+	* Los `alg` de JWE con acuerdo directo de clave: con ellos la parte de la
+	* clave cifrada va VACÍA (RFC 7516 §5.1 y RFC 7518 §4.5/§4.6); con cualquier
+	* otro tiene que traer algo.
+	*/
+	const DIRECT_KEY_ALGS = /* @__PURE__ */ new Set(["dir", "ECDH-ES"]);
+	/** Decodifica un segmento base64url como JSON, o null. */
+	function decodeSegment(part) {
 		try {
-			const part = String(token).split(".")[1];
 			if (!part) return null;
 			const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
 			const padded = b64.padEnd(Math.ceil(b64.length / 4) * 4, "=");
 			const binary = atob(padded);
 			const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
-			return JSON.parse(new TextDecoder("utf-8").decode(bytes));
+			const value = JSON.parse(new TextDecoder("utf-8").decode(bytes));
+			return value && typeof value === "object" && !Array.isArray(value) ? value : null;
 		} catch {
 			return null;
 		}
+	}
+	/**
+	* Decodifica el payload de un JWT sin validar la firma. Isomorfo: `atob` y
+	* `TextDecoder` existen tanto en el navegador como en Node 18+, así que sirve
+	* igual en el content script del navegador y en la extensión de VS Code.
+	* null para todo lo que no tenga tres partes: en un JWE la segunda es la clave
+	* cifrada, no un payload.
+	*/
+	function decodeJwtPayload(token) {
+		const parts = String(token).split(".");
+		return parts.length === 3 ? decodeSegment(parts[1]) : null;
+	}
+	/**
+	* La cabecera protegida de un JWS/JWE compacto (la primera parte). En un JWE es
+	* lo único legible: dice cómo va cifrado (`alg`, `enc`), no para quién.
+	*/
+	function decodeJoseHeader(token) {
+		return decodeSegment(String(token).split(".")[0]);
+	}
+	/** Tres partes base64url y un tamaño razonable. */
+	function isValidJwt(token) {
+		if (typeof token !== "string" || token.length > 8192) return false;
+		const parts = token.split(".");
+		return parts.length === 3 && parts.every((part) => part.length > 0 && SEGMENT.test(part));
+	}
+	/**
+	* Un JWE compacto bien formado (RFC 7516 §7.1): cinco partes base64url —
+	* cabecera, clave cifrada, IV, texto cifrado y tag —, una cabecera JSON con
+	* `alg` y `enc`, y la clave cifrada vacía sólo (y siempre) con acuerdo directo.
+	* No se descifra nada: basta con que tenga la forma de uno.
+	*/
+	function isValidJwe(token) {
+		if (typeof token !== "string" || token.length > 16384) return false;
+		const parts = token.split(".");
+		if (parts.length !== 5 || !parts.every((part) => SEGMENT.test(part))) return false;
+		const [header, encryptedKey, , ciphertext, tag] = parts;
+		if (!header || !ciphertext || !tag) return false;
+		const jose = decodeJoseHeader(token);
+		if (!jose || typeof jose.alg !== "string" || typeof jose.enc !== "string") return false;
+		if (!jose.alg || !jose.enc) return false;
+		return DIRECT_KEY_ALGS.has(jose.alg) ? encryptedKey === "" : encryptedKey !== "";
+	}
+	/** `jwt`, `jwe`, o null si no es ninguno de los dos. */
+	function tokenFormat(token) {
+		if (typeof token !== "string") return null;
+		const value = token.trim();
+		if (isValidJwt(value)) return "jwt";
+		if (isValidJwe(value)) return "jwe";
+		return null;
 	}
 	/** Extrae los claims relevantes, normalizando el nombre de usuario (upn). */
 	function extractClaims(token) {
@@ -92,7 +151,7 @@
 
 //#endregion
 //#region ../../packages/core/dist/token.js
-/** ¿Es un token de Substrate/Sydney, el que usa Copilot? */
+/** ¿Es un token de Substrate/Sydney, el que usa Copilot? (Un JWE nunca lo dice: va cifrado.) */
 	function isSydneyToken(token) {
 		const claims = decodeJwtPayload(token);
 		if (!claims) return false;
@@ -100,22 +159,50 @@
 		const scp = String(claims.scp || claims.scope || "");
 		return aud.includes("substrate.office.com") || aud.includes("substrate.svc.cloud.microsoft") || /sydney|m365chat/i.test(scp);
 	}
+	/**
+	* Caducidad conocida del token, en segundos epoch: el `exp` de un JWT o, si no
+	* se puede leer (JWE), la de los metadatos que vinieron con él. null cuando se
+	* desconoce — un JWE capturado del socket del chat: no se inventa ninguna.
+	*/
+	function tokenExpiry(profile) {
+		const exp = profile.claims?.exp ?? profile.expiresAt;
+		return typeof exp === "number" && Number.isFinite(exp) && exp > 0 ? exp : null;
+	}
+	/**
+	* Huella corta y estable de un token, para saber si dos lados tienen el MISMO
+	* sin enviarlo ni guardarlo otra vez (cyrb53: no criptográfica ni reversible en
+	* la práctica, y 53 bits bastan para distinguir renovaciones). Con un JWE no
+	* hay `exp` con el que comparar, así que la sincronización y el aviso de
+	* «M365 lo rechazó» se apoyan en esto.
+	*/
+	function tokenFingerprint(token) {
+		let h1 = 3735928559;
+		let h2 = 1103547991;
+		for (let i = 0; i < token.length; i++) {
+			const ch = token.charCodeAt(i);
+			h1 = Math.imul(h1 ^ ch, 2654435761);
+			h2 = Math.imul(h2 ^ ch, 1597334677);
+		}
+		h1 = Math.imul(h1 ^ h1 >>> 16, 2246822507) ^ Math.imul(h2 ^ h2 >>> 13, 3266489909);
+		h2 = Math.imul(h2 ^ h2 >>> 16, 2246822507) ^ Math.imul(h1 ^ h1 >>> 13, 3266489909);
+		return `${(4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36)}.${token.length}`;
+	}
 
 //#endregion
 //#region ../../packages/core/dist/capture.js
-/** Un JWT de verdad no se acerca a esto; algo mayor no es un token. */
-	const MAX_JWT_CHARS = 8192;
-	/** Frames SignalR salientes que se llegan a inspeccionar. */
+/** Frames SignalR salientes que se llegan a inspeccionar. */
 	const MAX_FRAME_CHARS = 1048576;
 	/** Plantilla de invocación que merece la pena guardar. */
 	const MAX_TEMPLATE_CHARS = 65536;
-	const MAX_ENDPOINT_CHARS = 2048;
-	/** Tres partes base64url y un tamaño razonable. */
-	function isValidJwt(token) {
-		if (typeof token !== "string" || token.length > 8192) return false;
-		const parts = token.split(".");
-		return parts.length === 3 && parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part));
-	}
+	/**
+	* El endpoint guardado, ya sin el token: la web lleva en `variants` cientos de
+	* flags, varios KB. El tope antiguo (2 KB) lo descartaba EN SILENCIO — sin
+	* endpoint no hay escenario que replicar, y una cuenta personal no puede
+	* conectar —, así que éste sólo para lo que no es una URL de verdad.
+	*/
+	const MAX_ENDPOINT_CHARS = 16384;
+	/** La URL del socket con el token dentro (un JWE de hasta 16 KB más el endpoint). */
+	const MAX_SOCKET_URL_CHARS = 32768;
 	/** `exp` en el futuro y un `iat` coherente con él. */
 	function areClaimsUsable(claims, now = Date.now()) {
 		if (!claims || typeof claims.exp !== "number" || claims.exp <= 0) return false;
@@ -127,40 +214,89 @@
 	/**
 	* Diagnostica un token candidato contra el store actual. `accepted` sólo viene
 	* cuando `diagnosis === 'accepted'`. Es la lógica de decisión única: tanto el
-	* sí/no (`acceptToken`) como el motivo salen de aquí.
+	* sí/no (`acceptToken`) como el motivo salen de aquí. `origin` sólo cambia algo
+	* con un JWE (ver {@link TokenOrigin}); sin él, un JWE no se acepta.
 	*/
-	function diagnoseToken(current, token, now = Date.now()) {
+	function diagnoseToken(current, token, now = Date.now(), origin) {
 		const candidate = token.trim();
+		const identity = origin?.kind === "socket" ? chathubIdentity(origin.url) : null;
+		if (isValidJwe(candidate)) return diagnoseJwe(current, candidate, now, origin, identity);
 		if (!isValidJwt(candidate)) return { diagnosis: "not-a-jwt" };
 		if (!isSydneyToken(candidate)) return { diagnosis: "not-sydney" };
 		const claims = extractClaims(candidate);
 		if (!claims) return { diagnosis: "no-claims" };
 		if (!areClaimsUsable(claims, now)) return { diagnosis: "expired" };
 		if (current.accessToken === candidate) return { diagnosis: "duplicate" };
+		if (!identity && current.identity && tokenFormat(current.accessToken) === "jwe" && (claims.oid !== current.identity.oid || claims.tid !== current.identity.tid)) return { diagnosis: "identity-mismatch" };
 		const currentExp = current.claims?.exp ?? 0;
 		if (claims.exp && currentExp && claims.exp < currentExp) return { diagnosis: "older-than-current" };
 		return {
 			diagnosis: "accepted",
 			accepted: {
 				accessToken: candidate,
-				claims
+				claims,
+				...identity ? { identity } : {},
+				expiresAt: void 0
+			}
+		};
+	}
+	function diagnoseJwe(current, candidate, now, origin, socketIdentity) {
+		let identity;
+		let expiresAt;
+		if (origin?.kind === "socket") {
+			if (!socketIdentity) return { diagnosis: "jwe-no-identity" };
+			identity = socketIdentity;
+		} else if (origin?.kind === "storage" && isSydneyCacheEntry(origin.entry)) {
+			if (!current.identity) return { diagnosis: "jwe-no-identity" };
+			identity = current.identity;
+			expiresAt = msalExpiresOn(origin.entry) ?? void 0;
+			if (expiresAt !== void 0 && expiresAt * 1e3 <= now) return { diagnosis: "expired" };
+		} else return { diagnosis: "jwe-untrusted-source" };
+		if (current.accessToken === candidate) return { diagnosis: "duplicate" };
+		const currentExp = tokenExpiry({
+			claims: current.claims ?? null,
+			expiresAt: current.expiresAt
+		});
+		if (expiresAt !== void 0 && currentExp !== null && expiresAt < currentExp) return { diagnosis: "older-than-current" };
+		const endpoint = origin?.kind === "socket" ? normalizeEndpoint(origin.url) : "";
+		return {
+			diagnosis: "accepted",
+			accepted: {
+				accessToken: candidate,
+				claims: null,
+				identity,
+				expiresAt,
+				...endpoint ? { endpoint } : {}
 			}
 		};
 	}
 	/**
 	* Lo que hay que guardar si `token` merece sustituir al actual, o null: debe
 	* ser un JWT válido, de Substrate/Sydney (el de Copilot, no cualquier token de
-	* Office), sin caducar, distinto del guardado y no más viejo que él.
+	* Office), sin caducar, distinto del guardado y no más viejo que él — o un JWE
+	* de un sitio que pruebe que es el del chat (ver {@link TokenOrigin}).
 	*/
-	function acceptToken(current, token, now = Date.now()) {
-		return diagnoseToken(current, token, now).accepted ?? null;
+	function acceptToken(current, token, now = Date.now(), origin) {
+		return diagnoseToken(current, token, now, origin).accepted ?? null;
+	}
+	/** Una entrada de la caché de MSAL con un access token para Sydney/Substrate. */
+	function isSydneyCacheEntry(entry) {
+		if (!entry || typeof entry.target !== "string") return false;
+		if (typeof entry.credentialType === "string" && !/accesstoken/i.test(entry.credentialType)) return false;
+		return /substrate\.office\.com|substrate\.svc\.cloud\.microsoft|sydney|m365chat/i.test(entry.target);
+	}
+	/** El `expiresOn` (segundos epoch, a menudo como texto) de una entrada de MSAL, o null. */
+	function msalExpiresOn(entry) {
+		const raw = entry?.expiresOn;
+		const value = typeof raw === "string" && /^\d{9,11}$/.test(raw) ? Number(raw) : raw;
+		return typeof value === "number" && Number.isInteger(value) && value > 1e9 && value < 1e11 ? value : null;
 	}
 	/**
 	* Tokens candidatos dentro de un valor de localStorage/sessionStorage: MSAL
 	* guarda cada access token como JSON (`secret`), otras librerías como
 	* `access_token`/`accessToken`, y algunas entradas son el JWT pelado.
 	*/
-	function tokensInStorageValue(value) {
+	function tokenCandidatesInStorageValue(value) {
 		if (!value || value.length < 40 || !value.includes("eyJ")) return [];
 		try {
 			const parsed = JSON.parse(value);
@@ -169,10 +305,16 @@
 				parsed.secret,
 				parsed.access_token,
 				parsed.accessToken
-			].filter((candidate) => typeof candidate === "string");
+			].filter((candidate) => typeof candidate === "string").map((token) => ({
+				token,
+				entry: parsed
+			}));
 		} catch {
 			const raw = value.trim();
-			return /^ey[\w-]+\.[\w-]+\.[\w-]+$/.test(raw) ? [raw] : [];
+			return /^ey[\w-]+\.[\w-]+\.[\w-]+$/.test(raw) ? [{
+				token: raw,
+				entry: null
+			}] : [];
 		}
 	}
 	/** El token que viaja en la query de la URL del WebSocket, si lo hay. */
@@ -205,26 +347,83 @@
 		const host = hostname.toLowerCase();
 		return MICROSOFT_HOST_SUFFIXES.some((suffix) => host === suffix.slice(1) || host.endsWith(suffix));
 	}
+	/** Lo que cabe en un segmento de ruta sin escaparlo: `oid` y `tid` no traen otra cosa. */
+	const IDENTITY_PART = /^[A-Za-z0-9._-]{1,128}$/;
+	/** `…/Chathub/{oid}@{tid}` (el `@` puede venir escapado). */
+	const CHATHUB_PATH = /^(\/(?:[^/]+\/)*chathub)\/([^/]+)\/?$/i;
+	/**
+	* La identidad de la sesión del chat en una URL de Chathub — sólo si es de
+	* Microsoft y por un canal cifrado (`wss:`, o `https:` copiada de DevTools).
+	* Es de donde salen `oid`/`tid` cuando el token es un JWE: no se fía de nada
+	* que no venga de ahí. null si la URL no lo es.
+	*/
+	function chathubIdentity(raw) {
+		if (typeof raw !== "string" || raw.length > MAX_SOCKET_URL_CHARS) return null;
+		try {
+			const url = new URL(raw);
+			if (url.protocol !== "wss:" && url.protocol !== "https:") return null;
+			if (url.username || url.password || url.port && url.port !== "443") return null;
+			if (!isMicrosoftHost(url.hostname)) return null;
+			const match = CHATHUB_PATH.exec(url.pathname);
+			if (!match) return null;
+			const segment = decodeURIComponent(match[2]);
+			const at = segment.lastIndexOf("@");
+			if (at <= 0) return null;
+			const oid = segment.slice(0, at);
+			const tid = segment.slice(at + 1);
+			if (!IDENTITY_PART.test(oid) || !IDENTITY_PART.test(tid)) return null;
+			return {
+				oid,
+				tid,
+				endpointBase: `wss://${url.hostname.toLowerCase()}${match[1]}`
+			};
+		} catch {
+			return null;
+		}
+	}
 	/**
 	* La URL del socket sin lo volátil (token, ids de sesión): no hay que guardar
 	* un token caducado dentro del endpoint. '' si no es un host de Microsoft.
 	*/
 	function normalizeEndpoint(raw) {
-		if (typeof raw !== "string" || raw.length > MAX_ENDPOINT_CHARS) return "";
+		if (typeof raw !== "string" || raw.length > MAX_SOCKET_URL_CHARS) return "";
 		try {
 			const url = new URL(raw.replace(/^ws/i, "http"));
 			if (!isMicrosoftHost(url.hostname)) return "";
-			for (const param of [
-				"access_token",
-				"ConversationId",
-				"chatsessionid",
-				"clientrequestid",
-				"X-SessionId"
-			]) url.searchParams.delete(param);
-			return url.toString().replace(/^http/i, "ws");
+			const names = Array.from(new Set(url.searchParams.keys()));
+			for (const name of names) {
+				const key = name.toLowerCase();
+				if (SESSION_PARAMS.has(key) || SECRET_PARAMS.has(key)) url.searchParams.delete(name);
+			}
+			const endpoint = url.toString().replace(/^http/i, "ws");
+			return endpoint.length > 16384 ? "" : endpoint;
 		} catch {
 			return "";
 		}
+	}
+	/** Ids de una sesión: se dice si van, nunca su valor. */
+	const SESSION_PARAMS = /* @__PURE__ */ new Set([
+		"conversationid",
+		"chatsessionid",
+		"clientrequestid",
+		"x-sessionid"
+	]);
+	/** Secretos: ni se nombran con valor. */
+	const SECRET_PARAMS = /* @__PURE__ */ new Set([
+		"access_token",
+		"id_token",
+		"token"
+	]);
+	/**
+	* ¿Se guarda `endpoint` como endpoint tentativo? No si ya hay uno confirmado
+	* (vio salir un `chat`), ni si el guardado es la URL de Chathub y éste no:
+	* Substrate abre otros sockets (presencia, notificaciones) después del chat, y
+	* antes pisaban el endpoint — y con él el `scenario` que replica un JWE.
+	*/
+	function shouldStoreTentativeEndpoint(current, endpoint) {
+		if (!endpoint || current.endpointConfirmed) return false;
+		if (!current.endpoint) return true;
+		return Boolean(chathubIdentity(endpoint)) || !chathubIdentity(current.endpoint);
 	}
 	/** SignalR separa los frames con este carácter (record separator). */
 	const RS = "";
@@ -271,14 +470,34 @@
 		if (tone) list.push(tone);
 		return list.slice(-20);
 	}
+	/**
+	* ¿Se puede usar el token guardado? Con caducidad conocida (el `exp` de un JWT
+	* o la de MSAL), si no ha pasado; con un JWE sin ella, sí — hasta que M365 lo
+	* rechace, que es lo único que lo dice.
+	*/
+	function isCaptureUsable(store, now = Date.now()) {
+		if (!store.accessToken) return false;
+		const format = tokenFormat(store.accessToken);
+		if (format === "jwt") return areClaimsUsable(store.claims, now);
+		if (format !== "jwe") return false;
+		const exp = tokenExpiry({
+			claims: store.claims ?? null,
+			expiresAt: store.expiresAt
+		});
+		return exp === null || exp * 1e3 > now;
+	}
 	/** El store sin el token si éste ya caducó (para invitar a recapturarlo), o null si no hay que tocarlo. */
 	function withoutExpiredToken(store, now = Date.now()) {
-		const exp = store.claims?.exp;
-		if (!store.accessToken || typeof exp !== "number" || exp * 1e3 > now) return null;
+		const exp = tokenExpiry({
+			claims: store.claims ?? null,
+			expiresAt: store.expiresAt
+		});
+		if (!store.accessToken || exp === null || exp * 1e3 > now) return null;
 		const cleaned = { ...store };
 		delete cleaned.accessToken;
 		delete cleaned.tokenSource;
 		delete cleaned.claims;
+		delete cleaned.expiresAt;
 		return cleaned;
 	}
 	/** Misma forma ignorando el sello temporal: sólo se escribe si algo cambió de verdad. */
@@ -303,6 +522,9 @@
 			invocationTemplate: store.invocationTemplate || null,
 			invocationType: store.invocationType || 4,
 			claims: store.claims || null,
+			...store.endpointConfirmed ? { endpointConfirmed: true } : {},
+			...store.identity ? { identity: { ...store.identity } } : {},
+			...typeof store.expiresAt === "number" ? { expiresAt: store.expiresAt } : {},
 			...store.observedTones && store.observedTones.length > 0 ? { observedTones: [...store.observedTones] } : {}
 		};
 	}
@@ -325,8 +547,11 @@
 				missingDelay: grown
 			};
 		}
-		const exp = store.claims?.exp;
-		const left = typeof exp === "number" ? exp * 1e3 - now : null;
+		const exp = tokenExpiry({
+			claims: store.claims ?? null,
+			expiresAt: store.expiresAt
+		});
+		const left = exp !== null ? exp * 1e3 - now : null;
 		return {
 			delay: left !== null && left <= 9e5 ? SCAN_EXPIRING_MS : SCAN_FRESH_MS,
 			missingDelay: SCAN_MISSING_MS
@@ -345,6 +570,7 @@
 	function needsResync(context) {
 		if (!context.hasToken) return false;
 		if (context.lastSyncAttemptAt !== null && context.now - context.lastSyncAttemptAt >= 0 && context.now - context.lastSyncAttemptAt < 3e4) return false;
+		if (context.currentTokenId) return context.syncedTokenId !== context.currentTokenId;
 		if (context.syncedTokenExp === null) return true;
 		if (context.currentTokenExp === null) return true;
 		return context.currentTokenExp > context.syncedTokenExp;
@@ -590,6 +816,7 @@
 	const MIN_PAGE_AGE_MS = 12e4;
 	const EMPTY_SYNC = {
 		syncedTokenExp: null,
+		syncedTokenId: null,
 		lastSyncAttemptAt: null,
 		lastSyncedAt: null,
 		lastError: null,
@@ -731,10 +958,16 @@
 		cleaned.capturedAt = (/* @__PURE__ */ new Date()).toISOString();
 		GM_setValue(CAPTURE_STORE_KEY, JSON.stringify(cleaned));
 	}
-	function offerToken(token, source) {
+	/** Expiry of the stored token: its `exp`, MSAL's for a JWE, or null when unknown. */
+	const storeExpiry = (store) => tokenExpiry({
+		claims: store.claims ?? null,
+		expiresAt: store.expiresAt
+	});
+	/** `origin` is what lets an encrypted token (JWE) in: see TokenOrigin in capture.ts. */
+	function offerToken(token, source, origin) {
 		if (!token) return;
 		try {
-			const accepted = acceptToken(readStore(), token);
+			const accepted = acceptToken(readStore(), token, Date.now(), origin);
 			if (!accepted) return;
 			writeStore({
 				...accepted,
@@ -746,9 +979,12 @@
 	function captureSocket(url, socket) {
 		const raw = String(url);
 		if (!isCopilotSocketUrl(raw)) return;
-		offerToken(tokenInSocketUrl(raw), "websocket-url");
+		offerToken(tokenInSocketUrl(raw), "websocket-url", {
+			kind: "socket",
+			url: raw
+		});
 		const endpoint = normalizeEndpoint(raw);
-		if (endpoint && !readStore().endpointConfirmed) writeStore({
+		if (shouldStoreTentativeEndpoint(readStore(), endpoint)) writeStore({
 			endpoint,
 			origin: location.origin,
 			userAgent: navigator.userAgent
@@ -791,7 +1027,7 @@
 		return null;
 	}
 	function offerBearer(value, source) {
-		if (value && /^bearer /i.test(value)) offerToken(value.slice(7), source);
+		if (value && /^bearer /i.test(value)) offerToken(value.slice(7), source, { kind: "header" });
 	}
 	function installHooks() {
 		if (PAGE.WebSocket) {
@@ -839,7 +1075,10 @@
 			for (let index = 0; index < length; index += 1) try {
 				const key = store.key(index);
 				if (!key || key === "m365copilot.capture.v1") continue;
-				for (const token of tokensInStorageValue(store.getItem(key))) offerToken(token, "msal-cache");
+				for (const { token, entry } of tokenCandidatesInStorageValue(store.getItem(key))) offerToken(token, "msal-cache", {
+					kind: "storage",
+					entry
+				});
 			} catch {}
 		}
 	}
@@ -868,9 +1107,12 @@
 	* which only exists not to hammer a VS Code that is not running.
 	*/
 	function hasUnsentToken() {
-		const exp = readStore().claims?.exp;
+		const store = readStore();
+		const exp = storeExpiry(store);
 		const sync = readSync();
-		return typeof exp === "number" && (sync.syncedTokenExp === null || exp > sync.syncedTokenExp) && sync.vscodeReachable !== false;
+		if (!store.accessToken || sync.vscodeReachable === false) return false;
+		if (exp === null) return sync.syncedTokenId !== tokenFingerprint(store.accessToken);
+		return sync.syncedTokenExp === null || exp > sync.syncedTokenExp;
 	}
 	/**
 	* The web app used a model (`tone`) VS Code has not been told about. The chat
@@ -890,13 +1132,15 @@
 	async function syncToVSCode(force = false) {
 		const store = readStore();
 		const profile = profileFromCapture(store, navigator.userAgent);
-		if (!profile || !areClaimsUsable(store.claims) || syncing) return false;
+		if (!profile || !isCaptureUsable(store) || syncing) return false;
 		const sync = readSync();
 		const now = Date.now();
 		if (!force && !needsResync({
 			capturedAt: store.capturedAt ?? null,
 			syncedTokenExp: sync.syncedTokenExp,
-			currentTokenExp: store.claims?.exp ?? null,
+			currentTokenExp: storeExpiry(store),
+			syncedTokenId: sync.syncedTokenId ?? null,
+			currentTokenId: storeExpiry(store) === null ? tokenFingerprint(profile.accessToken) : null,
 			hasToken: true,
 			lastSyncAttemptAt: sync.lastSyncAttemptAt,
 			now
@@ -907,7 +1151,8 @@
 			const status = await request("POST", TOKEN_ENDPOINT_PATH, JSON.stringify(profile));
 			if (status >= 200 && status < 300) {
 				writeSync({
-					syncedTokenExp: store.claims?.exp ?? null,
+					syncedTokenExp: storeExpiry(store),
+					syncedTokenId: tokenFingerprint(profile.accessToken),
 					syncedTones: profile.observedTones ?? [],
 					lastSyncedAt: Date.now(),
 					lastError: null,
@@ -940,7 +1185,7 @@
 		if (!IS_TOP || !readUi().autoReload || document.visibilityState !== "hidden") return;
 		const store = readStore();
 		const hadSession = Boolean(store.endpoint || store.invocationTemplate);
-		const expired = !store.accessToken || !areClaimsUsable(store.claims);
+		const expired = !isCaptureUsable(store);
 		if (!hadSession || !expired || Date.now() - LOADED_AT < MIN_PAGE_AGE_MS) return;
 		const { lastReloadAt } = readSync();
 		if (lastReloadAt && Date.now() - lastReloadAt < RELOAD_EVERY_MS) return;
@@ -1072,7 +1317,7 @@ button:focus-visible { outline: 2px solid #242424; outline-offset: 1px; }
 			const store = readStore();
 			const sync = readSync();
 			const hasToken = Boolean(store.accessToken);
-			const usable = hasToken && areClaimsUsable(store.claims);
+			const usable = hasToken && isCaptureUsable(store);
 			const state = connectionState({
 				hasToken,
 				expired: hasToken && !usable,
@@ -1092,8 +1337,8 @@ button:focus-visible { outline: 2px solid #242424; outline-offset: 1px; }
 			q(".status-title").textContent = title;
 			q(".status-title").toggleAttribute("data-busy", state === "waiting");
 			q(".status-sub").textContent = sub;
-			const exp = store.claims?.exp;
-			const minutes = typeof exp === "number" ? Math.round((exp * 1e3 - Date.now()) / 6e4) : null;
+			const exp = storeExpiry(store);
+			const minutes = exp !== null ? Math.round((exp * 1e3 - Date.now()) / 6e4) : null;
 			q("[data-value=\"token\"]").textContent = !hasToken ? T.tokenNone : !usable ? T.tokenExpired : minutes === null ? "✓" : fill(T.tokenLeft, minutes);
 			q("[data-value=\"vscode\"]").textContent = sync.vscodeReachable === null ? T.vscodeChecking : sync.vscodeReachable ? T.vscodeOk : T.vscodeDown;
 			const ago = sync.lastSyncedAt ? Math.floor((Date.now() - sync.lastSyncedAt) / 6e4) : null;

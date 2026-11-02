@@ -111,8 +111,12 @@ export class M365CopilotProvider implements vscode.LanguageModelChatProvider, vs
     }
     if (!isTokenUsable(profile)) {
       const mins = minutesUntilExpiry(profile);
-      debug(scope, `refused: the stored token expired (${mins} min)`);
       this.changeEmitter.fire();
+      if (profile.rejectedAt) {
+        debug(scope, `refused: M365 rejected the stored token at ${profile.rejectedAt}`);
+        throw userError(t("provider.tokenRejected"));
+      }
+      debug(scope, `refused: the stored token expired (${mins} min)`);
       throw userError(
         t("provider.tokenExpired", mins !== null ? t("provider.expiredAgo", Math.abs(mins)) : ""),
       );

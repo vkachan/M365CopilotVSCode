@@ -1,6 +1,15 @@
 import { randomUUID } from "node:crypto";
 import WebSocket from "ws";
-import { describeProfile, foreignAudience, type CopilotProfile } from "./profile";
+import { describeSocketParams } from "../index";
+import {
+  chatEndpointDiagnostics,
+  chatEndpointOf,
+  describeProfile,
+  foreignAudience,
+  tokenExpiry,
+  tokenFormat,
+  type CopilotProfile,
+} from "./profile";
 import { parseToneSelector, prettyTone } from "./modelCatalog";
 import { RunawayRepetitionGuard } from "./repetitionGuard";
 import { bizChatLocale, formatMoment, t } from "./i18n";
@@ -68,8 +77,8 @@ function scenarioFor(
   profile: CopilotProfile,
   paid: boolean,
 ): { scenario: string; licenseType?: string } {
-  if (!paid) return { scenario: INCLUDED_SCENARIO };
   const captured = capturedScenario(profile.endpoint);
+  if (!paid) return { scenario: INCLUDED_SCENARIO };
   return captured && accountTier(profile) === "paid"
     ? { scenario: captured.scenario, licenseType: captured.licenseType ?? PAID_LICENSE_TYPE }
     : { scenario: PAID_SCENARIO, licenseType: PAID_LICENSE_TYPE };
@@ -520,6 +529,51 @@ export function onModelOutcome(listener: ModelOutcomeListener | undefined): void
   modelOutcomeListener = listener;
 }
 
+/**
+ * Told when M365 refuses a token outright (HTTP 401/403 on the upgrade). For a
+ * token whose expiry cannot be read (a JWE) this is the only way to learn it is
+ * dead: the extension marks it so and the browser side renews it.
+ */
+export type AuthRejectedListener = (token: string, status: number) => void;
+let authRejectedListener: AuthRejectedListener | undefined;
+
+/** Set (or clear, with undefined) the one listener for rejected tokens. */
+export function onAuthRejected(listener: AuthRejectedListener | undefined): void {
+  authRejectedListener = listener;
+}
+
+/**
+ * Response headers worth a line in the log when the upgrade is refused: Azure
+ * AD / Substrate explain it there (`WWW-Authenticate`, `x-ms-diagnostics`,
+ * error codes) and the request ids let Microsoft find it. Never cookies.
+ */
+const DIAGNOSTIC_HEADER =
+  /^(www-authenticate|client-request-id|request-id|x-ms-[\w-]+|x-[\w-]*(error|diagnostic|reason)[\w-]*|x-calculatedbetarget|x-backendhttpstatus|x-feserver|x-beserver)$/i;
+
+/**
+ * The web app's socket parameters next to ours, sanitized (see
+ * `describeSocketParams`): `same` for what matches, `{browser, ours}` for what
+ * does not — a missing one shows as `absent`. Token and session ids are left out.
+ */
+export function compareHandshake(
+  captured: string | null | undefined,
+  ours: string,
+): Record<string, unknown> {
+  const browser = describeSocketParams(captured);
+  const built = describeSocketParams(ours) ?? {};
+  if (!browser) return { browser: "not captured", ours: built };
+  const out: Record<string, unknown> = {};
+  for (const key of new Set([...Object.keys(browser), ...Object.keys(built)])) {
+    // The token and the session ids are always this turn's own (and the
+    // captured endpoint never keeps them): nothing to compare.
+    if (VOLATILE_PARAMS.test(key)) continue;
+    const a = browser[key] ?? "absent";
+    const b = built[key] ?? "absent";
+    out[key] = a === b ? "same" : { browser: a, ours: b };
+  }
+  return out;
+}
+
 /** A rejection that says nothing about the model: retry later instead of flagging it. */
 const TRANSIENT_REJECTION = /thrott|rate.?limit|too many|capacity|busy|timeout|try again|429|503/i;
 
@@ -527,13 +581,18 @@ const TRANSIENT_REJECTION = /thrott|rate.?limit|too many|capacity|busy|timeout|t
 function describeUpgradeFailure(
   status: number,
   statusMessage: string,
-  token: string,
+  profile: CopilotProfile,
 ): CopilotClientError {
   // A token for another service (pasted by hand) explains the rejection better
   // than "expired": the fix is copying the right one, not re-capturing.
-  const audience = status === 401 || status === 403 ? foreignAudience(token) : null;
+  const audience = status === 401 || status === 403 ? foreignAudience(profile.accessToken) : null;
   if (audience) return new CopilotAuthError(t("client.error.foreignAudience", audience), status);
+  // Without a readable expiry there was no way to see this coming: say why.
+  if (status === 401 && tokenExpiry(profile) === null)
+    return new CopilotAuthError(t("client.error.401.unknownExpiry"), status);
   if (status === 401) return new CopilotAuthError(t("client.error.401"), status);
+  if (status === 403 && tokenFormat(profile.accessToken) === "jwe")
+    return new CopilotAuthError(t("client.error.403.personal"), status);
   if (status === 403) return new CopilotAuthError(t("client.error.403"), status);
   if (status === 429) return new CopilotClientError(t("client.error.429"));
   return new CopilotClientError(
@@ -592,14 +651,29 @@ export async function streamCopilotTurn(options: {
   // `tone` may name the paid scenario (`Claude_Sonnet@paid`); BizChat gets the bare tone.
   const selector = tone ? parseToneSelector(tone) : null;
   const wireTone = selector?.tone ?? null;
-  const scenario = scenarioFor(profile, selector?.paid ?? false);
+  // A personal account (JWE) replays the web app's own scenario — or none, if
+  // its socket had none —; a paid selector cannot add a work licence to it.
+  const jwe = tokenFormat(profile.accessToken) === "jwe";
+  const chatEndpoint = jwe ? chatEndpointOf(profile) : null;
+  const scenario = jwe
+    ? (capturedScenario(chatEndpoint) ?? { scenario: "" })
+    : scenarioFor(profile, selector?.paid ?? false);
 
   // The URL and invocation must agree; routing affinity must also survive
   // reconnects so subsequent turns reach the same regional conversation.
   const conversation = options.conversation ?? createCopilotConversation();
   const { conversationId, sessionKey, isStartOfSession } = conversation;
+  // A JWE's claims are encrypted: who to connect as comes from the Chathub URL
+  // the browser captured. Without it there is no URL to build — say so now.
+  if (jwe) log(t("log.chatEndpoint", JSON.stringify(chatEndpointDiagnostics(profile))));
+  if (jwe && !profile.identity) throw new CopilotAuthError(t("client.error.noIdentity"), 0);
+  if (jwe && !chatEndpoint) throw new CopilotAuthError(t("client.error.noChatEndpoint"), 0);
   const base =
-    options.endpointBase ?? testEndpointBase ?? `${DEFAULT_ENDPOINT_HOST}${DEFAULT_ENDPOINT_PATH}`;
+    options.endpointBase ??
+    testEndpointBase ??
+    (jwe && profile.identity
+      ? profile.identity.endpointBase
+      : `${DEFAULT_ENDPOINT_HOST}${DEFAULT_ENDPOINT_PATH}`);
   const url = buildEndpoint(profile, conversationId, base, mode, scenario);
   const invocationId = "0";
   const invocationType = profile.invocationType || 4;
@@ -927,14 +1001,26 @@ export async function streamCopilotTurn(options: {
       // header and a JSON body (`error`, `error_description`, correlation id).
       // Log both — this is the difference between "recaptura y ya" and an
       // actual root cause (wrong audience, Conditional Access, expired token).
-      for (const h of [
-        "www-authenticate",
-        "x-ms-diagnostics",
-        "x-ms-request-id",
-        "client-request-id",
-      ]) {
-        const v = res.headers[h];
-        if (v) log(t("log.header", h, String(v)));
+      for (const [h, v] of Object.entries(res.headers)) {
+        if (v && DIAGNOSTIC_HEADER.test(h)) log(t("log.header", h, String(v)));
+      }
+      // What was asked for next to what the web app's own socket asked for: a
+      // refusal at the upgrade is decided by this URL, these headers and the
+      // token, never by the chat frame (it is not sent yet).
+      if (status === 401 || status === 403) {
+        log(t("log.handshake", JSON.stringify(compareHandshake(profile.endpoint, url))));
+        log(
+          t(
+            "log.handshakeHeaders",
+            JSON.stringify({
+              Origin: profile.origin,
+              "User-Agent": profile.userAgent,
+              // A browser WebSocket cannot send headers of its own: this one is ours only.
+              "X-RoutingParameter-SessionKey": "<set>",
+              Cookie: "<none: not sent by this client>",
+            }),
+          ),
+        );
       }
 
       const bodyChunks: Buffer[] = [];
@@ -947,7 +1033,12 @@ export async function streamCopilotTurn(options: {
         // now with an accurate message instead of waiting out the generic
         // handshake timeout — that 15 s stall misled users into thinking the
         // connection stalled when the token was actually rejected outright.
-        fail(describeUpgradeFailure(status, statusMessage, profile.accessToken));
+        // Only a 401 says the token itself is no good (expired, revoked). A 403
+        // is a refusal of THIS request — licence, scenario, account type —:
+        // renewing the token would not change it, and doing so in a loop is
+        // what flooded VS Code with "token renewed" before.
+        if (status === 401) authRejectedListener?.(profile.accessToken, status);
+        fail(describeUpgradeFailure(status, statusMessage, profile));
       });
     });
 
@@ -1635,8 +1726,13 @@ function buildEndpoint(
 ): string {
   const sessionId = randomUUID();
 
-  const oid = profile.claims?.oid ?? "";
-  const tid = profile.claims?.tid ?? "";
+  // A JWT says who it is for; a JWE does not, and its identity is the one in
+  // the trusted Chathub URL it was captured from (checked in streamCopilotTurn).
+  const jwe = tokenFormat(profile.accessToken) === "jwe";
+  const oid = (jwe ? profile.identity?.oid : profile.claims?.oid) ?? "";
+  const tid = (jwe ? profile.identity?.tid : profile.claims?.tid) ?? "";
+  const path = `${base}/${encodeURIComponent(oid)}@${encodeURIComponent(tid)}`;
+  if (jwe) return `${path}?${personalParams(profile, conversationId, sessionId, mode)}`;
   const params = new URLSearchParams({
     access_token: profile.accessToken,
     ConversationId: conversationId,
@@ -1654,7 +1750,40 @@ function buildEndpoint(
   const variants = mode === "web" ? capturedVariants(profile.endpoint) : undefined;
   if (variants) params.set("variants", variants);
   if (temporaryChat) params.set("disableMemory", "1");
-  return `${base}/${oid}@${tid}?${params.toString()}`;
+  return `${path}?${params.toString()}`;
+}
+
+/** Ids of the web app's own session in its URL: ours replace them. */
+const VOLATILE_PARAMS =
+  /^(access_token|conversationid|chatsessionid|clientrequestid|x-sessionid)$/i;
+
+/**
+ * A personal account's query: the web app's own (from {@link chatEndpointOf})
+ * with this turn's ids and token instead of its own — nothing invented, no
+ * work-licence defaults. `variants` only on web turns, as for a JWT (they turn
+ * on the web app's plugins, which break the text tool protocol).
+ */
+function personalParams(
+  profile: CopilotProfile,
+  conversationId: string,
+  sessionId: string,
+  mode: TurnMode,
+): string {
+  const params = new URLSearchParams();
+  params.set("access_token", profile.accessToken);
+  params.set("ConversationId", conversationId);
+  params.set("chatsessionid", sessionId);
+  params.set("clientrequestid", sessionId);
+  params.set("X-SessionId", sessionId);
+  const captured = new URL(chatEndpointOf(profile)!.replace(/^wss?:/, "https:")).searchParams;
+  for (const [name, value] of captured) {
+    if (VOLATILE_PARAMS.test(name)) continue;
+    if (/^variants$/i.test(name) && mode !== "web") continue;
+    if (/^disablememory$/i.test(name)) continue;
+    params.append(name, value);
+  }
+  if (temporaryChat) params.set("disableMemory", "1");
+  return params.toString();
 }
 
 /** `…/m365Copilot/Chathub` → `…/m365Copilot/UploadFile`, over https (http for a local mock). */

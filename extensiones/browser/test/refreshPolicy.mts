@@ -8,6 +8,7 @@
  * Run: node --experimental-strip-types test/refreshPolicy.mts
  */
 import assert from "node:assert/strict";
+import { deliveryKey } from "@m365copilot/core";
 import {
   ATTEMPTS_BEFORE_HELP,
   BASE_BACKOFF_MS,
@@ -16,6 +17,7 @@ import {
   RESYNC_COOLDOWN_MS,
   backoffFor,
   decideRefreshAction,
+  isAlreadyDelivered,
   msUntilExpiry,
   needsResync,
   type RefreshContext,
@@ -119,13 +121,47 @@ function testExpiredAndMissing() {
     "none",
   );
 
-  // Un token sin `exp` no se puede evaluar: se renueva por si acaso.
-  assert.equal(
-    decideRefreshAction(context({ token: { hasToken: true, expEpochSeconds: null } })).action,
-    "rescan",
+  // Un token sin caducidad conocida (JWE de cuenta personal) no se renueva a
+  // ciegas: antes esto pedía re-escanear y recargar la pestaña en bucle.
+  const unknown = decideRefreshAction(
+    context({ token: { hasToken: true, expEpochSeconds: null } }),
   );
+  assert.equal(unknown.action, "none");
+  assert.match(unknown.reason, /caducidad conocida/);
 
   console.log("  ✓ token caducado, ausente, sin exp y sin captura previa");
+}
+
+function testRejectedByVSCode() {
+  // M365 rechazó el token (lo dice VS Code): con caducidad desconocida es la
+  // señal para renovar, y sigue la escalada normal.
+  const rejected = { hasToken: true, expEpochSeconds: null, rejected: true };
+  assert.equal(decideRefreshAction(context({ token: rejected })).action, "rescan");
+  assert.equal(decideRefreshAction(context({ token: rejected, attempts: 1 })).action, "reload");
+  assert.equal(decideRefreshAction(context({ token: rejected, hasM365Tab: false })).action, "open");
+  assert.equal(
+    decideRefreshAction(context({ token: rejected, attempts: ATTEMPTS_BEFORE_HELP })).action,
+    "needsUser",
+  );
+  // Un JWT revocado antes de su `exp` también se renueva ya.
+  assert.equal(
+    decideRefreshAction(
+      context({
+        token: { hasToken: true, expEpochSeconds: (NOW + 40 * MINUTE) / 1000, rejected: true },
+      }),
+    ).action,
+    "rescan",
+  );
+  // Con caducidad de MSAL (JWE) se usa como la de un JWT.
+  assert.equal(
+    decideRefreshAction(
+      context({ token: { hasToken: true, expEpochSeconds: (NOW + 5 * MINUTE) / 1000 } }),
+    ).action,
+    "rescan",
+  );
+  console.log(
+    "  ✓ token rechazado por M365 (aviso de VS Code): se renueva aunque no se sepa su exp",
+  );
 }
 
 function testBackoff() {
@@ -172,13 +208,49 @@ function testResync() {
     true,
   );
 
+  // Sin `exp` (JWE) decide la huella: una vez por token, y otra cuando cambia.
+  const jwe = { ...base, currentTokenExp: null, syncedTokenExp: null };
+  assert.equal(needsResync({ ...jwe, currentTokenId: "a.1", syncedTokenId: null }), true);
+  assert.equal(needsResync({ ...jwe, currentTokenId: "a.1", syncedTokenId: "a.1" }), false);
+  assert.equal(needsResync({ ...jwe, currentTokenId: "b.1", syncedTokenId: "a.1" }), true);
+  // Sin huellas, como antes: un `exp` desconocido se reenvía siempre (de ahí las huellas).
+  assert.equal(needsResync({ ...jwe }), true);
+
   console.log("  ✓ reenvío a VS Code sólo cuando hace falta, con cooldown");
 }
 
+function testDeliveryDedupe() {
+  const profile = {
+    version: 1,
+    accessToken: "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..iv.ciphertext.tag",
+    endpoint: null,
+    origin: "https://m365.cloud.microsoft",
+    userAgent: "UA",
+    invocationTemplate: null,
+    invocationType: 4,
+    claims: null,
+    capturedAt: "2026-11-02T10:00:00Z",
+  };
+  const key = deliveryKey(profile);
+  assert.equal(isAlreadyDelivered(profile, key), true);
+  assert.equal(
+    isAlreadyDelivered({ ...profile, capturedAt: "2026-11-02T10:00:01Z" }, key),
+    true,
+    "a new timestamp is the same delivery",
+  );
+  assert.equal(isAlreadyDelivered({ ...profile, accessToken: "eyJ.renewed" }, key), false);
+  assert.equal(isAlreadyDelivered({ ...profile, observedTones: ["Reasoning"] }, key), false);
+  assert.equal(isAlreadyDelivered(profile, null), false, "never confirmed: send");
+  assert.equal(isAlreadyDelivered(null, key), false);
+  console.log("  ✓ el mismo perfil (sólo cambia el sello) no se reenvía; otro token o modelo sí");
+}
+
 console.log("refreshPolicy.ts");
+testDeliveryDedupe();
 testHealthyToken();
 testEscalation();
 testExpiredAndMissing();
+testRejectedByVSCode();
 testBackoff();
 testResync();
 console.log("\nAll tests passed.");

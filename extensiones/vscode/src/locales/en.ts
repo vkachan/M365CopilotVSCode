@@ -48,6 +48,8 @@ export const en = {
     "Paste the token captured by the browser extension or the userscript, or the URL of the “Chathub” WebSocket copied from DevTools (the full JSON profile also works: only its accessToken is used).",
   "paste.placeholder": "eyJ…  or  wss://…/Chathub/…?access_token=eyJ…",
   "paste.validFor": ", valid for ~{0} min",
+  "paste.expiryUnknown":
+    ", personal account (its token is encrypted, so its expiry is unknown — it is renewed when M365 rejects it)",
   "paste.fromClipboard":
     "A token was found in the clipboard — press Enter to use it, or paste a different one.",
   "paste.ready":
@@ -96,6 +98,7 @@ export const en = {
   "status.state": "Status: {0}",
   "status.tokenValid": "token valid",
   "status.tokenExpired": "token EXPIRED",
+  "status.tokenRejected": "token REJECTED by M365",
   "status.minutesLeft": "{0} min left",
   "status.expiredAgo": "expired {0} min ago",
   "status.captured": "Captured: {0}",
@@ -107,6 +110,8 @@ export const en = {
   "statusbar.tooltip.tokenValid": "Token valid · {0} min left",
   "statusbar.tooltip.tokenValidNoExpiry": "Token valid",
   "statusbar.tooltip.tokenExpired": "Token expired {0} min ago",
+  "statusbar.tooltip.tokenRejected":
+    "M365 rejected the token — the browser extension renews it, or paste a new one",
   "statusbar.tooltip.tokenMissing": "No token yet — paste one to start",
   "statusbar.tooltip.completionsOn": "Inline completions: on",
   "statusbar.tooltip.completionsOff": "Inline completions: off",
@@ -117,6 +122,7 @@ export const en = {
   "statusbar.tooltip.pendingEdits": "Agent changes awaiting review: {0}",
   "statusbar.tooltip.click": "Click to open the M365 Copilot menu.",
   "statusbar.renewed": "M365 Copilot: token renewed automatically ({0} min left).",
+  "statusbar.renewedNoExpiry": "M365 Copilot: token renewed automatically.",
 
   // ------------------------------------------------------------ quick menu
   "menu.title": "M365 Copilot",
@@ -154,6 +160,8 @@ export const en = {
   "watcher.expiringSoon": "M365 Copilot: the token expires in {0} min and has not been renewed.",
   "watcher.expired":
     "M365 Copilot: the token has expired. Capture a new one to keep using the models.",
+  "watcher.rejected":
+    "M365 Copilot: Microsoft rejected the session token (it has probably expired). The browser extension renews it on its own while it can reach m365.cloud.microsoft; otherwise paste a new one.",
   "watcher.pasteToken": "Paste token",
   "watcher.openM365": "Open M365 Copilot",
 
@@ -224,6 +232,8 @@ export const en = {
   "provider.tokenExpired":
     "The M365 Copilot token has expired{0}. Capture it again (browser extension or userscript) and paste it once more.",
   "provider.expiredAgo": " ({0} min ago)",
+  "provider.tokenRejected":
+    "M365 Copilot rejected the saved token. Keep m365.cloud.microsoft open with the browser extension installed so it renews it, or paste the chat WebSocket URL again (“M365 Copilot: Paste profile or token”).",
 
   // ------------------------------------------------------------ client (BizChat)
   "turn.remoteSandbox":

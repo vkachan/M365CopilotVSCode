@@ -6,8 +6,11 @@
  * Run: node --experimental-strip-types --import ./test/register.mjs test/capture.mts
  */
 import assert from "node:assert/strict";
+import { randomBytes } from "node:crypto";
 import {
   EXPIRY_WATCH_MS,
+  MAX_ENDPOINT_CHARS,
+  MAX_JWE_CHARS,
   MAX_JWT_CHARS,
   SCAN_EXPIRING_MS,
   SCAN_FRESH_MS,
@@ -15,7 +18,22 @@ import {
   SCAN_MISSING_MS,
   acceptToken,
   areClaimsUsable,
+  chathubIdentity,
+  decodeJwtPayload,
+  isCaptureUsable,
+  isSydneyCacheEntry,
+  isValidJwe,
+  msalExpiresOn,
+  needsResync,
+  sanitizeIdentity,
+  tokenCandidatesInStorageValue,
+  tokenExpiry,
+  tokenFingerprint,
+  tokenFormat,
   connectionArtSvg,
+  deliveryKey,
+  describeSocketParams,
+  shouldStoreTentativeEndpoint,
   connectionState,
   diagnoseToken,
   inspectOutgoingFrames,
@@ -52,6 +70,22 @@ function jwt(claims: Record<string, unknown>): string {
 }
 
 const inMinutes = (minutes: number) => Math.floor(NOW / 1000) + minutes * 60;
+
+/** Un JWE sintético: cabecera real, el resto bytes al azar (nada que descifrar). */
+const rand = (bytes: number) => randomBytes(bytes).toString("base64url");
+function jwe(
+  header: Record<string, unknown> = { alg: "RSA-OAEP-256", enc: "A256GCM" },
+  ciphertextBytes = 900,
+): string {
+  const key = header.alg === "dir" || header.alg === "ECDH-ES" ? "" : rand(256);
+  return `${b64url(header)}.${key}.${rand(12)}.${rand(ciphertextBytes)}.${rand(16)}`;
+}
+
+const OID = "00000000-0000-0000-1234-56789abcdef0";
+const TID = "9188040d-6c67-4c5b-b112-36a304b66dad";
+const chathub = (token: string, host = "substrate.office.com") =>
+  `wss://${host}/m365Copilot/Chathub/${OID}@${TID}?clientrequestid=c1&X-SessionId=s1` +
+  `&access_token=${token}&source=officeweb&scenario=OfficeWebConsumerCopilot`;
 
 function testTokenValidation() {
   assert.equal(isValidJwt(jwt({ exp: inMinutes(60) })), true);
@@ -141,7 +175,10 @@ function testSources() {
   assert.equal(isMicrosoftHost("evil-office.com"), false);
   assert.equal(isMicrosoftHost("office.com.evil.net"), false);
   assert.equal(normalizeEndpoint("wss://evil.example/Chathub?access_token=x"), "");
-  assert.equal(normalizeEndpoint(`wss://substrate.office.com/${"x".repeat(3000)}`), "");
+  assert.equal(
+    normalizeEndpoint(`wss://substrate.office.com/${"x".repeat(MAX_ENDPOINT_CHARS)}`),
+    "",
+  );
   console.log(
     "  ✓ fuentes: caché MSAL, JWT pelado, URL del WebSocket; endpoint de substrate.office.com aceptado",
   );
@@ -325,8 +362,365 @@ function testObservedTones() {
   );
 }
 
+function testJweRecognition() {
+  const token = jwe();
+  assert.equal(tokenFormat(token), "jwe");
+  assert.equal(isValidJwe(token), true);
+  assert.equal(isValidJwt(token), false, "cinco partes no son un JWT");
+  assert.equal(tokenFormat(jwt({ exp: inMinutes(60) })), "jwt");
+  assert.equal(decodeJwtPayload(token), null, "la segunda parte de un JWE no es un payload");
+
+  // `dir` / `ECDH-ES`: la clave cifrada va vacía — y sólo con ellos.
+  const direct = jwe({ alg: "dir", enc: "A128CBC-HS256" });
+  assert.equal(direct.split(".")[1], "");
+  assert.equal(tokenFormat(direct), "jwe");
+  assert.equal(tokenFormat(jwe({ alg: "ECDH-ES", enc: "A256GCM" })), "jwe");
+  const [h, , iv, ct, tag] = direct.split(".");
+  assert.equal(isValidJwe(`${h}.${rand(256)}.${iv}.${ct}.${tag}`), false, "dir con clave");
+  const [h2, , iv2, ct2, tag2] = token.split(".");
+  assert.equal(isValidJwe(`${h2}..${iv2}.${ct2}.${tag2}`), false, "RSA-OAEP sin clave");
+
+  // Malformados.
+  const parts = token.split(".");
+  assert.equal(isValidJwe(parts.slice(0, 4).join(".")), false, "cuatro partes");
+  assert.equal(isValidJwe(`${token}.x`), false, "seis partes");
+  assert.equal(
+    isValidJwe(`${parts[0]}.${parts[1]}.${parts[2]}..${parts[4]}`),
+    false,
+    "sin texto cifrado",
+  );
+  assert.equal(isValidJwe(`${parts.slice(0, 4).join(".")}.`), false, "sin tag");
+  assert.equal(isValidJwe(`.${parts.slice(1).join(".")}`), false, "sin cabecera");
+  assert.equal(isValidJwe(token.replace(/\.(.)/, ".+")), false, "base64url sólo");
+  assert.equal(isValidJwe(`${rand(20)}.${parts.slice(1).join(".")}`), false, "cabecera no JSON");
+  assert.equal(isValidJwe(jwe({ alg: "RSA-OAEP" })), false, "cabecera sin enc");
+  assert.equal(isValidJwe(jwe({ enc: "A256GCM" })), false, "cabecera sin alg");
+  assert.equal(
+    isValidJwe(`${parts[0]}.${parts[1]}.${parts[2]}.${"A".repeat(MAX_JWE_CHARS)}.${parts[4]}`),
+    false,
+    "tope de tamaño",
+  );
+  assert.equal(tokenFormat("a.b.c.d.e"), null);
+  assert.equal(tokenFormat(undefined), null);
+  console.log(
+    "  ✓ JWE compacto: cinco partes, cabecera con alg/enc, clave vacía sólo con dir/ECDH-ES",
+  );
+}
+
+function testChathubIdentity() {
+  const token = jwe();
+  assert.deepEqual(chathubIdentity(chathub(token)), {
+    oid: OID,
+    tid: TID,
+    endpointBase: "wss://substrate.office.com/m365Copilot/Chathub",
+  });
+  // El `@` escapado y https (copiada de DevTools) también valen.
+  assert.equal(
+    chathubIdentity(`https://substrate.office.com/m365Copilot/Chathub/${OID}%40${TID}?a=1`)?.tid,
+    TID,
+  );
+  // Sólo Microsoft, sólo cifrado, sólo la ruta del hub y nada raro en los ids.
+  for (const bad of [
+    chathub(token, "substrate.office.com.evil.example"),
+    chathub(token, "evil.example"),
+    `ws://substrate.office.com/m365Copilot/Chathub/${OID}@${TID}`,
+    `http://substrate.office.com/m365Copilot/Chathub/${OID}@${TID}`,
+    `wss://user:pw@substrate.office.com/m365Copilot/Chathub/${OID}@${TID}`,
+    `wss://substrate.office.com:8443/m365Copilot/Chathub/${OID}@${TID}`,
+    `wss://substrate.office.com/m365Copilot/Presence/${OID}@${TID}`,
+    `wss://substrate.office.com/m365Copilot/Chathub/${OID}`,
+    `wss://substrate.office.com/m365Copilot/Chathub/@${TID}`,
+    `wss://substrate.office.com/m365Copilot/Chathub/${OID}@`,
+    `wss://substrate.office.com/m365Copilot/Chathub/a%2Fb@${TID}`,
+    `wss://substrate.office.com/m365Copilot/Chathub/${OID}@${TID}/extra`,
+    "not a url",
+  ]) {
+    assert.equal(chathubIdentity(bad), null, bad);
+  }
+  // Una identidad que llega en un JSON se revalida igual.
+  const identity = chathubIdentity(chathub(token))!;
+  assert.deepEqual(sanitizeIdentity(identity), identity);
+  assert.equal(sanitizeIdentity({ ...identity, endpointBase: "wss://evil.example/Chathub" }), null);
+  assert.equal(sanitizeIdentity({ ...identity, oid: "../x" }), null);
+  assert.equal(
+    sanitizeIdentity({ ...identity, endpointBase: `${identity.endpointBase}?x=1` }),
+    null,
+  );
+  assert.equal(sanitizeIdentity("x"), null);
+  console.log("  ✓ identidad {oid}@{tid} sólo de una URL de Chathub de Microsoft por wss/https");
+}
+
+function testJweDiagnosis() {
+  const token = jwe();
+  const socket = { kind: "socket" as const, url: chathub(token) };
+
+  // Del socket del chat: aceptado, sin claims inventados, con identidad.
+  const fromSocket = diagnoseToken({}, token, NOW, socket);
+  assert.equal(fromSocket.diagnosis, "accepted");
+  assert.equal(fromSocket.accepted?.claims, null);
+  assert.equal(fromSocket.accepted?.identity?.oid, OID);
+  assert.equal(fromSocket.accepted?.expiresAt, undefined);
+  // El endpoint de ESE socket viaja con el token: nunca uno sin el otro.
+  assert.equal(fromSocket.accepted?.endpoint, normalizeEndpoint(socket.url));
+  assert.equal(tokenExpiry(fromSocket.accepted!), null, "caducidad desconocida, no inventada");
+
+  // Sin origen, de una cabecera cualquiera o de un socket sin identidad: no.
+  assert.equal(diagnoseToken({}, token, NOW).diagnosis, "jwe-untrusted-source");
+  assert.equal(diagnoseToken({}, token, NOW, { kind: "header" }).diagnosis, "jwe-untrusted-source");
+  assert.equal(
+    diagnoseToken({}, token, NOW, {
+      kind: "socket",
+      url: `wss://evil.example/m365Copilot/Chathub/${OID}@${TID}?access_token=${token}`,
+    }).diagnosis,
+    "jwe-no-identity",
+  );
+
+  const current = { accessToken: token, claims: null, identity: fromSocket.accepted!.identity };
+  assert.equal(diagnoseToken(current, token, NOW, socket).diagnosis, "duplicate");
+  // Renovado: la web abre otro socket con otro JWE.
+  const renewed = jwe();
+  assert.equal(
+    diagnoseToken(current, renewed, NOW, { kind: "socket", url: chathub(renewed) }).diagnosis,
+    "accepted",
+  );
+
+  // Caché de MSAL: sólo la entrada de Sydney, reutilizando la identidad del socket.
+  const entry = {
+    credentialType: "AccessToken",
+    target: "https://substrate.office.com/sydney/.default openid profile",
+    expiresOn: String(inMinutes(55)),
+  };
+  const cached = jwe();
+  assert.equal(
+    diagnoseToken({}, cached, NOW, { kind: "storage", entry }).diagnosis,
+    "jwe-no-identity",
+  );
+  const fromCache = diagnoseToken(current, cached, NOW, { kind: "storage", entry });
+  assert.equal(fromCache.diagnosis, "accepted");
+  assert.equal(fromCache.accepted?.expiresAt, inMinutes(55), "la caducidad real de MSAL");
+  assert.deepEqual(fromCache.accepted?.identity, current.identity);
+  assert.equal(
+    diagnoseToken(current, cached, NOW, {
+      kind: "storage",
+      entry: { ...entry, target: "https://graph.microsoft.com/.default" },
+    }).diagnosis,
+    "jwe-untrusted-source",
+  );
+  assert.equal(
+    diagnoseToken(current, cached, NOW, {
+      kind: "storage",
+      entry: { ...entry, expiresOn: String(inMinutes(-1)) },
+    }).diagnosis,
+    "expired",
+  );
+  assert.equal(
+    diagnoseToken({ ...current, expiresAt: inMinutes(80) }, cached, NOW, { kind: "storage", entry })
+      .diagnosis,
+    "older-than-current",
+  );
+  assert.equal(isSydneyCacheEntry({ credentialType: "IdToken", target: "sydney" }), false);
+  assert.equal(msalExpiresOn({ expiresOn: "abc" }), null);
+  assert.equal(msalExpiresOn({ expiresOn: 12 }), null);
+
+  // Con la sesión del chat en JWE, un JWT de Substrate de OTRA cuenta no la pisa.
+  const otherAccount = jwt({ exp: inMinutes(60), oid: "someone-else", tid: TID });
+  assert.equal(
+    diagnoseToken(current, otherAccount, NOW, { kind: "storage", entry: null }).diagnosis,
+    "identity-mismatch",
+  );
+  const sameAccount = jwt({ exp: inMinutes(60), oid: OID, tid: TID });
+  assert.equal(diagnoseToken(current, sameAccount, NOW, { kind: "storage" }).diagnosis, "accepted");
+  // …y del socket del chat un JWT siempre vale (es la prueba buena).
+  assert.equal(
+    diagnoseToken(current, otherAccount, NOW, { kind: "socket", url: chathub(otherAccount) })
+      .diagnosis,
+    "accepted",
+  );
+
+  // JWT de siempre: el origen no cambia nada (compatibilidad).
+  const fresh = jwt({ exp: inMinutes(60) });
+  for (const origin of [undefined, socket, { kind: "header" as const }]) {
+    assert.equal(diagnoseToken({}, fresh, NOW, origin).diagnosis, "accepted");
+  }
+  assert.equal(acceptToken({}, fresh, NOW)?.expiresAt, undefined);
+  console.log(
+    "  ✓ un JWE se acepta del socket del chat o de la entrada de Sydney de MSAL, nunca de un fetch",
+  );
+}
+
+function testJweStorageAndProfile() {
+  const token = jwe();
+  const entry = {
+    credentialType: "AccessToken",
+    secret: token,
+    target: "https://substrate.office.com/sydney/.default",
+    expiresOn: String(inMinutes(30)),
+  };
+  assert.deepEqual(tokenCandidatesInStorageValue(JSON.stringify(entry)), [{ token, entry }]);
+
+  // El perfil que va a VS Code lleva la identidad, sin claims ni caducidad inventados.
+  const accepted = acceptToken({}, token, NOW, { kind: "socket", url: chathub(token) })!;
+  const store = {
+    ...accepted,
+    endpoint: normalizeEndpoint(chathub(token)),
+    capturedAt: new Date(NOW).toISOString(),
+  };
+  const profile = profileFromCapture(store, "UA")!;
+  assert.equal(profile.accessToken, token);
+  assert.equal(profile.claims, null);
+  assert.equal(profile.identity?.tid, TID);
+  assert.equal("expiresAt" in profile, false);
+  assert.doesNotMatch(profile.endpoint ?? "", /access_token/);
+  assert.match(profile.endpoint ?? "", /scenario=OfficeWebConsumerCopilot/);
+  // Un JSON redondo: lo que se envía por el puente local.
+  assert.deepEqual(JSON.parse(JSON.stringify(profile)).identity, profile.identity);
+
+  // La URL de un JWE es larga: el endpoint se conserva igual (el tope va sin el token).
+  const big = chathub(jwe(undefined, 2400));
+  assert.ok(big.length > 2048, "más que el tope antiguo, que la descartaba entera");
+  assert.notEqual(normalizeEndpoint(big), "");
+  // Varios KB de `variants` (lo normal en la web real) se conservan; el
+  // resultado sigue acotado.
+  const flags = Array.from({ length: 300 }, (_, i) => `feature.flight_${i}`).join(",");
+  const withFlags = normalizeEndpoint(`${big}&variants=${flags}`);
+  assert.ok(withFlags.length > 4000);
+  assert.equal(new URL(withFlags.replace(/^wss/, "https")).searchParams.get("variants"), flags);
+  assert.equal(normalizeEndpoint(`${big}&pad=${"x".repeat(MAX_ENDPOINT_CHARS)}`), "", "acotado");
+  // Los ids de sesión y los tokens se quitan sin importar mayúsculas.
+  const stripped = normalizeEndpoint(
+    `${chathub(jwe())}&conversationId=c&CHATSESSIONID=s&id_token=secret&keep=1`,
+  );
+  assert.doesNotMatch(stripped, /conversationId|CHATSESSIONID|id_token|access_token|secret/i);
+  assert.match(stripped, /keep=1/);
+
+  // Usable con caducidad desconocida; con la de MSAL, hasta que pasa.
+  assert.equal(isCaptureUsable(store, NOW), true);
+  assert.equal(isCaptureUsable({ ...store, expiresAt: inMinutes(-1) }, NOW), false);
+  assert.equal(isCaptureUsable({ ...store, accessToken: "garbage" }, NOW), false);
+  assert.equal(
+    isCaptureUsable(
+      { accessToken: jwt({ exp: inMinutes(5) }), claims: { exp: inMinutes(5) } },
+      NOW,
+    ),
+    true,
+  );
+  // Sin caducidad conocida no se poda; con la de MSAL vencida, sí.
+  assert.equal(withoutExpiredToken(store, NOW), null);
+  const pruned = withoutExpiredToken({ ...store, expiresAt: inMinutes(-1) }, NOW)!;
+  assert.equal(pruned.accessToken, undefined);
+  assert.equal(pruned.expiresAt, undefined);
+  assert.deepEqual(pruned.identity, store.identity, "la identidad se queda para el siguiente");
+  // El escaneo vigila de lejos un token sin caducidad, y aprieta cerca de la de MSAL.
+  assert.equal(nextScan(store, SCAN_MISSING_MS, NOW).delay, SCAN_FRESH_MS);
+  assert.equal(
+    nextScan({ ...store, expiresAt: inMinutes(5) }, SCAN_MISSING_MS, NOW).delay,
+    SCAN_EXPIRING_MS,
+  );
+
+  // Sustituir el JWE por un JWT borra la caducidad de MSAL que ya no le corresponde.
+  const merged = {
+    ...store,
+    expiresAt: inMinutes(30),
+    ...acceptToken(store, jwt({ exp: inMinutes(60), oid: OID, tid: TID }), NOW)!,
+  };
+  assert.equal(JSON.parse(JSON.stringify(merged)).expiresAt, undefined);
+
+  // Huella estable, distinta por token, sin el token dentro.
+  assert.equal(tokenFingerprint(token), tokenFingerprint(token));
+  assert.notEqual(tokenFingerprint(token), tokenFingerprint(jwe()));
+  assert.equal(
+    needsResync({
+      capturedAt: null,
+      syncedTokenExp: null,
+      currentTokenExp: null,
+      syncedTokenId: tokenFingerprint(token),
+      currentTokenId: tokenFingerprint(token),
+      hasToken: true,
+      lastSyncAttemptAt: null,
+      now: NOW,
+    }),
+    false,
+  );
+  console.log(
+    "  ✓ perfil JWE: identidad, endpoint sin token, caducidad desconocida y huella para sincronizar",
+  );
+}
+
+function testEndpointChoiceAndDiagnostics() {
+  const chat = normalizeEndpoint(chathub(jwe()));
+  const presence = `wss://substrate.office.com/m365Copilot/Presence/${OID}@${TID}?source=officeweb`;
+  // Substrate opens other sockets after the chat one: they no longer clobber it.
+  assert.equal(shouldStoreTentativeEndpoint({}, presence), true);
+  assert.equal(
+    shouldStoreTentativeEndpoint({ endpoint: presence }, chat),
+    true,
+    "chat beats presence",
+  );
+  assert.equal(shouldStoreTentativeEndpoint({ endpoint: chat }, presence), false);
+  assert.equal(shouldStoreTentativeEndpoint({ endpoint: chat }, chat), true);
+  assert.equal(
+    shouldStoreTentativeEndpoint({ endpoint: presence, endpointConfirmed: true }, chat),
+    false,
+  );
+  assert.equal(shouldStoreTentativeEndpoint({}, ""), false);
+
+  // The confirmation reaches VS Code (diagnostics).
+  const store = { accessToken: jwe(), endpoint: chat, endpointConfirmed: true };
+  assert.equal(profileFromCapture(store, "UA")?.endpointConfirmed, true);
+  assert.equal(
+    "endpointConfirmed" in profileFromCapture({ ...store, endpointConfirmed: false }, "UA")!,
+    false,
+  );
+
+  // What a log may show about a socket URL: routing values, never the token or ids.
+  const token = jwe();
+  const described = describeSocketParams(
+    `${chathub(token)}&variants=${"f".repeat(300)}&ConversationId=c`,
+  )!;
+  assert.deepEqual(
+    {
+      host: described.host,
+      path: described.path,
+      scenario: described.scenario,
+      source: described.source,
+      access_token: described.access_token,
+      ConversationId: described.ConversationId,
+      variants: described.variants,
+    },
+    {
+      host: "substrate.office.com",
+      path: "/m365Copilot/Chathub/{oid}@{tid}",
+      scenario: "OfficeWebConsumerCopilot",
+      source: "officeweb",
+      access_token: "<redacted>",
+      ConversationId: "<set>",
+      variants: "<300 chars>",
+    },
+  );
+  assert.ok(!JSON.stringify(described).includes(token.slice(0, 30)));
+  assert.ok(!JSON.stringify(described).includes(OID), "ids are masked in the path");
+  assert.equal(describeSocketParams(null), null);
+
+  // Delivery key: a new timestamp is the same delivery; a new token or model is not.
+  const profile = profileFromCapture({ ...store, capturedAt: "2026-01-01T00:00:00Z" }, "UA")!;
+  assert.equal(
+    deliveryKey(profile),
+    deliveryKey({ ...profile, capturedAt: "2026-01-01T00:00:05Z" }),
+  );
+  assert.notEqual(deliveryKey(profile), deliveryKey({ ...profile, accessToken: jwe() }));
+  assert.notEqual(deliveryKey(profile), deliveryKey({ ...profile, observedTones: ["Reasoning"] }));
+  console.log(
+    "  ✓ endpoint: el del chat no lo pisa otro socket; diagnóstico saneado y clave de entrega estable",
+  );
+}
+
 testTokenValidation();
 testDiagnosis();
+testEndpointChoiceAndDiagnostics();
+testJweRecognition();
+testChathubIdentity();
+testJweDiagnosis();
+testJweStorageAndProfile();
 testSources();
 testFrames();
 testStore();

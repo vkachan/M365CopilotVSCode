@@ -28,7 +28,7 @@ import {
   TOKEN_SERVER_PORT,
   type CopilotProfile,
 } from "@m365copilot/core";
-import { parsePastedProfile } from "@m365copilot/core/bizchat";
+import { parsePastedProfile, tokenExpiry, tokenFormat } from "@m365copilot/core/bizchat";
 import type { LanguageSetting } from "./i18n";
 
 /** Where the token and the settings live when `--config-dir` does not say otherwise. */
@@ -95,9 +95,12 @@ export class TuiStore {
   /** The stored profile, or null when there is none — or it is not one. */
   readProfile(): CopilotProfile | null {
     try {
-      const parsed = JSON.parse(fs.readFileSync(this.profilePath, "utf8")) as Partial<CopilotProfile>;
-      if (typeof parsed.accessToken !== "string" || parsed.accessToken.split(".").length !== 3)
-        return null;
+      const parsed = JSON.parse(
+        fs.readFileSync(this.profilePath, "utf8"),
+      ) as Partial<CopilotProfile>;
+      // A JWT, or a JWE (personal accounts) — which is only usable with its identity.
+      const format = tokenFormat(parsed.accessToken);
+      if (!format || (format === "jwe" && !parsed.identity)) return null;
       return parsed as CopilotProfile;
     } catch {
       return null;
@@ -276,7 +279,7 @@ export class TokenReceiver {
           this.onReceived({ kind: "token", profile });
           respond(res, 200, {
             success: true,
-            expiresAt: profile.claims?.exp,
+            expiresAt: tokenExpiry(profile),
             user: profile.claims?.upn,
           });
         } catch (error) {

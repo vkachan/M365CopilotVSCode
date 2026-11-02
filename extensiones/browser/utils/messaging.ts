@@ -13,6 +13,8 @@ export interface RefreshStatus {
   lastSyncedAt: string | null;
   /** Minutos hasta la caducidad del token guardado, o null si no se sabe. */
   minutesLeft: number | null;
+  /** VS Code dice que M365 rechazó el token guardado: hay que renovarlo. */
+  tokenRejected: boolean;
   refreshState: RefreshState;
   syncState: SyncState;
   autoOpenTab: boolean;

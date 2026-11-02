@@ -50,6 +50,8 @@ export const es: Record<keyof typeof en, string> = {
     "Pega el token capturado con la extensión de navegador o el userscript, o la URL del WebSocket «Chathub» copiada de DevTools (el «perfil completo» JSON también vale: sólo se usa su accessToken).",
   "paste.placeholder": "eyJ…  o  wss://…/Chathub/…?access_token=eyJ…",
   "paste.validFor": ", válido ~{0} min",
+  "paste.expiryUnknown":
+    ", cuenta personal (su token va cifrado, así que no se sabe cuándo caduca — se renueva cuando M365 lo rechaza)",
   "paste.fromClipboard": "Hay un token en el portapapeles — pulsa Intro para usarlo, o pega otro.",
   "paste.ready":
     "M365 Copilot listo{0}{1}. Elige un modelo «M365 Copilot» en el chat o escribe @m365.",
@@ -99,6 +101,7 @@ export const es: Record<keyof typeof en, string> = {
   "status.state": "Estado: {0}",
   "status.tokenValid": "token válido",
   "status.tokenExpired": "token CADUCADO",
+  "status.tokenRejected": "token RECHAZADO por M365",
   "status.minutesLeft": "{0} min restantes",
   "status.expiredAgo": "caducó hace {0} min",
   "status.captured": "Capturado: {0}",
@@ -110,6 +113,8 @@ export const es: Record<keyof typeof en, string> = {
   "statusbar.tooltip.tokenValid": "Token válido · quedan {0} min",
   "statusbar.tooltip.tokenValidNoExpiry": "Token válido",
   "statusbar.tooltip.tokenExpired": "Token caducado hace {0} min",
+  "statusbar.tooltip.tokenRejected":
+    "M365 rechazó el token — la extensión de navegador lo renueva, o pega uno nuevo",
   "statusbar.tooltip.tokenMissing": "Sin token todavía — pega uno para empezar",
   "statusbar.tooltip.completionsOn": "Autocompletado en línea: activado",
   "statusbar.tooltip.completionsOff": "Autocompletado en línea: desactivado",
@@ -120,6 +125,7 @@ export const es: Record<keyof typeof en, string> = {
   "statusbar.tooltip.pendingEdits": "Cambios del agente pendientes de revisar: {0}",
   "statusbar.tooltip.click": "Clic para abrir el menú de M365 Copilot.",
   "statusbar.renewed": "M365 Copilot: token renovado automáticamente (quedan {0} min).",
+  "statusbar.renewedNoExpiry": "M365 Copilot: token renovado automáticamente.",
 
   // ------------------------------------------------------------ menú rápido
   "menu.title": "M365 Copilot",
@@ -158,6 +164,8 @@ export const es: Record<keyof typeof en, string> = {
   "watcher.expiringSoon": "M365 Copilot: el token caduca en {0} min y no se ha renovado.",
   "watcher.expired":
     "M365 Copilot: el token ha caducado. Captura uno nuevo para seguir usando los modelos.",
+  "watcher.rejected":
+    "M365 Copilot: Microsoft rechazó el token de sesión (lo más probable es que haya caducado). La extensión de navegador lo renueva sola mientras pueda llegar a m365.cloud.microsoft; si no, pega uno nuevo.",
   "watcher.pasteToken": "Pegar token",
   "watcher.openM365": "Abrir M365 Copilot",
 
@@ -230,6 +238,8 @@ export const es: Record<keyof typeof en, string> = {
   "provider.tokenExpired":
     "El token de M365 Copilot ha caducado{0}. Vuelve a capturarlo (extensión de navegador o userscript) y pégalo de nuevo.",
   "provider.expiredAgo": " (hace {0} min)",
+  "provider.tokenRejected":
+    "M365 Copilot rechazó el token guardado. Deja m365.cloud.microsoft abierto con la extensión de navegador instalada para que lo renueve, o vuelve a pegar la URL del WebSocket del chat («M365 Copilot: Pegar perfil o token»).",
 
   // ------------------------------------------------------------ cliente (BizChat)
   "turn.remoteSandbox":

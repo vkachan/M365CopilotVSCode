@@ -121,6 +121,9 @@ export function formatDebugData(value: unknown): string {
 // ------------------------------------------------------------------- redaction
 
 const JWT = /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*/g;
+/** A compact JWE (personal accounts): five parts, the encrypted key may be empty. Before {@link JWT}. */
+const JWE =
+  /eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]+/g;
 const URL_SECRET =
   /([?&](?:access_token|id_token|refresh_token|token|sig|signature|client_secret|password|api[_-]?key)=)[^&\s"'#]+/gi;
 const AUTH_SCHEME = /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/g;
@@ -130,7 +133,7 @@ const HEADER_SECRET =
   /^(\s*(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key)\s*[:=]\s*).+$/gim;
 
 /**
- * Hides what must never leave the machine in a shared log: JWTs (shown as a
+ * Hides what must never leave the machine in a shared log: JWTs and JWEs (shown as a
  * length, so "is there a token?" is still answerable), `access_token=` style
  * query values, `Bearer …`, secret-looking JSON fields and credential headers.
  */
@@ -140,6 +143,7 @@ export function redactSecrets(text: string): string {
     .replace(JSON_SECRET, "$1<REDACTED>$3")
     .replace(HEADER_SECRET, "$1<REDACTED>")
     .replace(AUTH_SCHEME, "$1 <REDACTED>")
+    .replace(JWE, (jwe) => `<JWE ${jwe.length} chars>`)
     .replace(JWT, (jwt) => `<JWT ${jwt.length} chars>`);
 }
 

@@ -11,6 +11,7 @@ import {
   looksLikeProfile,
   minutesUntilExpiry,
   parsePastedProfile,
+  tokenFormat,
   ProfileParseError,
   type CopilotProfile,
   CopilotClientError,
@@ -211,7 +212,12 @@ export async function promptForProfile(store: ProfileStore): Promise<CopilotProf
 export async function announceProfile(profile: CopilotProfile): Promise<void> {
   const who = profile.claims?.upn ? ` (${profile.claims.upn})` : "";
   const mins = minutesUntilExpiry(profile);
-  const expiry = mins !== null ? t("paste.validFor", mins) : "";
+  const expiry =
+    mins !== null
+      ? t("paste.validFor", mins)
+      : tokenFormat(profile.accessToken) === "jwe"
+        ? t("paste.expiryUnknown")
+        : "";
   const openChat = t("paste.openChat");
   const picked = await vscode.window.showInformationMessage(
     t("paste.ready", who, expiry),
@@ -480,6 +486,7 @@ function indexSummary(status: IndexStatus): string {
 function tokenSummary(profile: Awaited<ReturnType<ProfileStore["get"]>>): string {
   if (!profile) return t("statusbar.tooltip.tokenMissing");
   const mins = minutesUntilExpiry(profile);
+  if (profile.rejectedAt) return t("status.tokenRejected");
   if (!isTokenUsable(profile)) {
     return mins !== null
       ? `${t("status.tokenExpired")} (${t("status.expiredAgo", Math.abs(mins))})`

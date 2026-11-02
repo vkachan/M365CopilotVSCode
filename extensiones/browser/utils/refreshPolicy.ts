@@ -7,6 +7,7 @@
  * — nada de temporizadores vivos ni de estado en memoria — y así además se puede
  * probar fuera del navegador.
  */
+import { deliveryKey, type CopilotProfile } from "@m365copilot/core";
 
 /** Se renueva con margen: un token que caduca a mitad de una respuesta la rompe. */
 export const RENEW_MARGIN_MS = 12 * 60 * 1000;
@@ -37,8 +38,17 @@ export type RefreshAction =
 
 export interface TokenSnapshot {
   readonly hasToken: boolean;
-  /** `claims.exp` del token guardado, en segundos epoch. */
+  /**
+   * Caducidad del token guardado, en segundos epoch: su `claims.exp`, o la de
+   * MSAL si va cifrado. null si se desconoce (un JWE de cuenta personal).
+   */
   readonly expEpochSeconds: number | null;
+  /**
+   * VS Code avisó de que M365 rechazó ESTE token (401/403). Con caducidad
+   * desconocida es lo que dice que hay que renovar; con un JWT, adelanta la
+   * renovación aunque su `exp` no haya llegado.
+   */
+  readonly rejected?: boolean;
 }
 
 export interface RefreshContext {
@@ -79,11 +89,18 @@ export function decideRefreshAction(context: RefreshContext): RefreshDecision {
   const { now, token, hasM365Tab, attempts } = context;
 
   const left = msUntilExpiry(token, now);
-  const needsRenewal = !token.hasToken || left === null || left <= RENEW_MARGIN_MS;
+  // Sin caducidad conocida (JWE) no se renueva a ciegas — recargar la pestaña
+  // cada minuto no la adivinaría —: la web trae uno nuevo cada vez que abre el
+  // socket del chat, y si M365 lo rechaza VS Code lo dice.
+  const needsRenewal =
+    !token.hasToken || token.rejected === true || (left !== null && left <= RENEW_MARGIN_MS);
   if (!needsRenewal) {
     return {
       action: "none",
-      reason: `quedan ${Math.round((left ?? 0) / 60000)} min de token`,
+      reason:
+        left === null
+          ? "token cifrado sin caducidad conocida: se renueva si M365 lo rechaza"
+          : `quedan ${Math.round(left / 60000)} min de token`,
     };
   }
 
@@ -133,6 +150,18 @@ function remainingBackoff(context: RefreshContext): number {
   // la renovación para siempre.
   if (elapsed < 0) return 0;
   return Math.max(0, backoffFor(context.attempts) - elapsed);
+}
+
+/**
+ * ¿Tiene VS Code ya exactamente este perfil? Mismo `deliveryKey` que el último
+ * envío confirmado: un re-escaneo republica el perfil desde cada frame, y cada
+ * copia era un POST (y un «token renovado» en VS Code).
+ */
+export function isAlreadyDelivered(
+  profile: CopilotProfile | null,
+  syncedProfileKey: string | null | undefined,
+): boolean {
+  return Boolean(profile && syncedProfileKey && syncedProfileKey === deliveryKey(profile));
 }
 
 // La decisión de re-sincronizar con VS Code vive en @m365copilot/core (la

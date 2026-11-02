@@ -9,6 +9,8 @@ import { ConnectionArt } from "./components/ConnectionArt";
 interface ProfileState {
   hasToken: boolean;
   minutesLeft: number | null;
+  /** M365 rechazó el token guardado (lo dice VS Code): se trata como caducado. */
+  rejected: boolean;
   capturedAt: string | null;
   /** Última acción del auto-renovador (ver utils/refreshPolicy.ts). */
   refreshAction: string | null;
@@ -17,6 +19,7 @@ interface ProfileState {
 const EMPTY: ProfileState = {
   hasToken: false,
   minutesLeft: null,
+  rejected: false,
   capturedAt: null,
   refreshAction: null,
 };
@@ -51,6 +54,7 @@ export default function App() {
       setProfile({
         hasToken: Boolean(store.accessToken),
         minutesLeft: status.minutesLeft,
+        rejected: status.tokenRejected,
         capturedAt: store.capturedAt || null,
         refreshAction: status.refreshState.lastAction,
       });
@@ -133,7 +137,7 @@ export default function App() {
       window.close();
     });
 
-  const expired = profile.minutesLeft !== null && profile.minutesLeft <= 0;
+  const expired = profile.rejected || (profile.minutesLeft !== null && profile.minutesLeft <= 0);
   const needsUser = profile.refreshAction === "needsUser";
   const hero = deriveHero(profile.hasToken, expired, vscode, needsUser);
   const artState = connectionState({

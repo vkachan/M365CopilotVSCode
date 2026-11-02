@@ -9,12 +9,19 @@
  * import the real sources unchanged.
  */
 const CANDIDATES = [".ts", ".js", ".mjs", "/index.ts", "/index.js"];
+/** WXT's `@/` alias: the extension's root (the entrypoints import `@/utils/…`). */
+const ROOT = new URL("../", import.meta.url);
 
 export async function resolve(specifier, context, nextResolve) {
+  if (specifier.startsWith("@/")) {
+    return resolve(new URL(specifier.slice(2), ROOT).href, context, nextResolve);
+  }
   try {
     return await nextResolve(specifier, context);
   } catch (error) {
-    const extensionless = specifier.startsWith(".") && !/\.[cm]?[jt]sx?$/i.test(specifier);
+    const extensionless =
+      (specifier.startsWith(".") || specifier.startsWith("file:")) &&
+      !/\.[cm]?[jt]sx?$/i.test(specifier);
     if (!extensionless || error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
     for (const candidate of CANDIDATES) {
       try {

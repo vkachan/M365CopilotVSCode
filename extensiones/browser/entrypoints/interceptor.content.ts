@@ -9,12 +9,15 @@ import {
   nextScan,
   normalizeEndpoint,
   sameCapture,
+  shouldStoreTentativeEndpoint,
+  tokenCandidatesInStorageValue,
+  tokenExpiry,
   tokenInSocketUrl,
-  tokensInStorageValue,
   toneOfTemplate,
   withObservedTone,
   withoutExpiredToken,
   type CaptureStore,
+  type TokenOrigin,
 } from "@m365copilot/core";
 import { logger } from "@/utils/logger";
 
@@ -106,18 +109,26 @@ export default defineContentScript({
       localStorage.setItem(CAPTURE_STORE_KEY, JSON.stringify(cleaned));
     }
 
-    /** Guarda un token sólo si es de Sydney, válido y no más viejo que el que ya teníamos. */
-    function offerToken(token: string, where: string): void {
+    /**
+     * Guarda un token sólo si es de Sydney, válido y no más viejo que el que ya
+     * teníamos. `origin` es lo que deja aceptar un JWE (cuentas personales): no
+     * dice para quién es, así que vale el sitio del que sale (ver capture.ts).
+     */
+    function offerToken(token: string, where: string, origin: TokenOrigin): void {
       try {
-        const { diagnosis, accepted } = diagnoseToken(readStore(), token);
+        const { diagnosis, accepted } = diagnoseToken(readStore(), token, Date.now(), origin);
         if (!accepted) {
           // `not-sydney` es de lo más normal (cada fetch a Graph trae su
           // bearer), por eso sólo se registra en modo verboso.
           diag(`token descartado desde ${where}: ${diagnosis}`);
           return;
         }
-        const minutes = Math.round(((accepted.claims.exp ?? 0) * 1000 - Date.now()) / 60000);
-        logger.info(`Token capturado desde ${where}, caduca en ${minutes} min`);
+        const exp = tokenExpiry(accepted);
+        logger.info(
+          exp === null
+            ? `Token capturado desde ${where} (cifrado, caducidad desconocida)`
+            : `Token capturado desde ${where}, caduca en ${Math.round((exp * 1000 - Date.now()) / 60000)} min`,
+        );
         writeStore({ ...accepted, tokenSource: where });
       } catch (error) {
         logger.error(`Error al procesar token desde ${where}:`, error);
@@ -137,14 +148,14 @@ export default defineContentScript({
       // El token viaja en la query: se extrae ANTES de normalizar la URL.
       const token = tokenInSocketUrl(url);
       diag("socket de copilot; token en la URL:", Boolean(token));
-      if (token) offerToken(token, "websocket-url");
+      if (token) offerToken(token, "websocket-url", { kind: "socket", url: String(url) });
 
       // Substrate abre varios WebSockets (presencia, notificaciones…). Guardamos
       // éste sólo de forma tentativa hasta que veamos que envía un frame `chat`,
       // que es la prueba definitiva de que es el hub del chat. Un endpoint ya
       // confirmado no se pisa con un socket cualquiera.
       const endpoint = normalizeEndpoint(String(url));
-      if (endpoint && !readStore().endpointConfirmed) {
+      if (shouldStoreTentativeEndpoint(readStore(), endpoint)) {
         writeStore({ endpoint, origin: location.origin, userAgent: navigator.userAgent });
       }
 
@@ -215,7 +226,8 @@ export default defineContentScript({
           if (!auth && typeof Request !== "undefined" && input instanceof Request) {
             auth = input.headers.get("authorization");
           }
-          if (auth && /^bearer /i.test(auth)) offerToken(auth.slice(7).trim(), "fetch-header");
+          if (auth && /^bearer /i.test(auth))
+            offerToken(auth.slice(7).trim(), "fetch-header", { kind: "header" });
         } catch {
           /* ignorar */
         }
@@ -228,7 +240,7 @@ export default defineContentScript({
       window.XMLHttpRequest.prototype.setRequestHeader = function (name: string, value: string) {
         try {
           if (String(name).toLowerCase() === "authorization" && /^bearer /i.test(String(value))) {
-            offerToken(String(value).slice(7).trim(), "xhr-header");
+            offerToken(String(value).slice(7).trim(), "xhr-header", { kind: "header" });
           }
         } catch {
           /* ignorar */
@@ -254,9 +266,9 @@ export default defineContentScript({
             const key = store.key(i);
             if (!key || key === CAPTURE_STORE_KEY) continue;
             keysScanned++;
-            for (const token of tokensInStorageValue(store.getItem(key))) {
+            for (const { token, entry } of tokenCandidatesInStorageValue(store.getItem(key))) {
               candidates++;
-              offerToken(token, "msal-cache");
+              offerToken(token, "msal-cache", { kind: "storage", entry });
             }
           } catch {
             /* entrada ilegible: la siguiente */

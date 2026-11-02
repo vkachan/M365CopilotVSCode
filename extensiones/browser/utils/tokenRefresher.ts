@@ -19,7 +19,7 @@
  *    pestaña que re-escanee la caché de MSAL (la web renueva su propio token
  *    sola) → recargar la pestaña → abrir una en segundo plano.
  */
-import { M365_CHAT_URL } from "@m365copilot/core";
+import { M365_CHAT_URL, tokenExpiry, tokenFingerprint } from "@m365copilot/core";
 import { ext } from "./api";
 import { logger } from "./logger";
 import {
@@ -56,7 +56,16 @@ export type SyncToVSCode = (profile: unknown) => Promise<boolean>;
  * content script lo pide al instante — y el único que funciona si esa pestaña
  * no llega a cargar.
  */
-export type SignOutPoll = () => Promise<void>;
+export type SignOutPoll = () => Promise<VSCodeVerdict | void>;
+
+/**
+ * Lo que VS Code dice del token en ese mismo latido (su health-check): la
+ * huella del que M365 le rechazó, si alguno. Con un JWE, cuya caducidad no se
+ * puede leer, es lo que dispara la renovación.
+ */
+export interface VSCodeVerdict {
+  readonly rejectedTokenId: string | null;
+}
 
 let syncToVSCode: SyncToVSCode = async () => false;
 let pollSignOutRequest: SignOutPoll = async () => {};
@@ -85,11 +94,17 @@ async function findM365Tabs(): Promise<chrome.tabs.Tab[]> {
   }
 }
 
-function snapshotOf(profile: any): TokenSnapshot {
-  const exp = profile?.claims?.exp;
+function snapshotOf(profile: any, verdict?: VSCodeVerdict | void): TokenSnapshot {
+  const hasToken = typeof profile?.accessToken === "string" && profile.accessToken.length > 0;
   return {
-    hasToken: Boolean(profile?.accessToken),
-    expEpochSeconds: typeof exp === "number" ? exp : null,
+    hasToken,
+    expEpochSeconds: hasToken
+      ? tokenExpiry({ claims: profile.claims ?? null, expiresAt: profile.expiresAt })
+      : null,
+    rejected:
+      hasToken &&
+      Boolean(verdict?.rejectedTokenId) &&
+      verdict?.rejectedTokenId === tokenFingerprint(profile.accessToken),
   };
 }
 
@@ -176,8 +191,9 @@ export async function runRefreshCycle(): Promise<RefreshDecision> {
   // 0. ¿VS Code ha pedido cerrar la sesión? Va primero: no tiene sentido
   //    renovar un token que estamos a punto de tirar. Aislado porque el
   //    servidor local puede no estar escuchando, y eso no es un fallo.
+  let verdict: VSCodeVerdict | void = undefined;
   try {
-    await pollSignOutRequest();
+    verdict = await pollSignOutRequest();
   } catch (error) {
     logger.debug("No se pudo comprobar si VS Code pide cerrar sesión:", error);
   }
@@ -188,7 +204,13 @@ export async function runRefreshCycle(): Promise<RefreshDecision> {
   const autoOpenTab = await getStorage("autoOpenTab");
   const hasEverCaptured = await getStorage("hasEverCaptured");
   const now = Date.now();
-  const token = snapshotOf(profile);
+  const token = snapshotOf(profile, verdict);
+  if (token.rejected)
+    logger.info("VS Code avisa de que M365 rechazó el token guardado; se renueva");
+  // Para el popup, que no lee el health-check: «renovando», no «activo».
+  const rejectedTokenId = verdict ? verdict.rejectedTokenId : (syncState.rejectedTokenId ?? null);
+  if (rejectedTokenId !== (syncState.rejectedTokenId ?? null))
+    await patchStorage("syncState", { rejectedTokenId });
 
   // 1. Reenviar lo que ya tenemos. Cubre el caso de VS Code arrancando DESPUÉS
   //    de la captura, que antes dejaba el token en el navegador para siempre.
@@ -197,7 +219,13 @@ export async function runRefreshCycle(): Promise<RefreshDecision> {
       capturedAt: profile?.capturedAt ?? null,
       syncedTokenExp: syncState.syncedTokenExp,
       currentTokenExp: token.expEpochSeconds,
-      hasToken: token.hasToken,
+      // Sin caducidad conocida (JWE) decide la huella; con un JWT, su `exp` como siempre.
+      syncedTokenId: syncState.syncedTokenId ?? null,
+      currentTokenId:
+        token.hasToken && token.expEpochSeconds === null
+          ? tokenFingerprint(profile.accessToken)
+          : null,
+      hasToken: token.hasToken && !token.rejected,
       lastSyncAttemptAt: syncState.lastSyncAttemptAt,
       now,
     })

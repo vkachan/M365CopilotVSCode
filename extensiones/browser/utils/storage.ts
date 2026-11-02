@@ -26,6 +26,12 @@ export interface RefreshState {
 export interface SyncState {
   /** `exp` del token que VS Code confirmó haber recibido. */
   syncedTokenExp: number | null;
+  /** Huella (`tokenFingerprint`) de ese token: la que decide con un JWE, que no tiene `exp`. */
+  syncedTokenId: string | null;
+  /** `deliveryKey` del último perfil que VS Code confirmó: el mismo no se reenvía. */
+  syncedProfileKey: string | null;
+  /** Huella del token que VS Code dice que M365 rechazó (su health-check), o null. */
+  rejectedTokenId: string | null;
   lastSyncAttemptAt: number | null;
   lastError: string | null;
 }
@@ -41,6 +47,9 @@ export const EMPTY_REFRESH_STATE: RefreshState = {
 
 export const EMPTY_SYNC_STATE: SyncState = {
   syncedTokenExp: null,
+  syncedTokenId: null,
+  rejectedTokenId: null,
+  syncedProfileKey: null,
   lastSyncAttemptAt: null,
   lastError: null,
 };

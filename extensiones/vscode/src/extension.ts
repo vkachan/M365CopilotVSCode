@@ -14,6 +14,7 @@ import {
   minutesUntilExpiry,
   debug,
   initLogger,
+  onAuthRejected,
   log,
   showLog,
   type LogSink,
@@ -130,9 +131,14 @@ export function activate(context: vscode.ExtensionContext): TestingApi | undefin
   });
   const tokenServer = new TokenAutoRefreshServer(store, (profile) => {
     const minutes = minutesUntilExpiry(profile);
-    if (minutes !== null)
-      void vscode.window.setStatusBarMessage(t("statusbar.renewed", minutes), 5000);
+    void vscode.window.setStatusBarMessage(
+      minutes !== null ? t("statusbar.renewed", minutes) : t("statusbar.renewedNoExpiry"),
+      5000,
+    );
   });
+  // M365 refused a token: from now on it is not usable (the only way to tell
+  // for one whose expiry cannot be read), and the browser side renews it.
+  onAuthRejected((token) => void store.markRejected(token));
   tokenServer.start();
   // The local project index (RAG): context for every request, tools, search.
   const projectIndex = new ProjectIndexService(log);
@@ -170,6 +176,7 @@ export function activate(context: vscode.ExtensionContext): TestingApi | undefin
     statusBar,
     debugSession,
     { dispose: stopWatchingThrottle },
+    { dispose: () => onAuthRejected(undefined) },
     tokenServer,
     provider,
     workspaceEdits,

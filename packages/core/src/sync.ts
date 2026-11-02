@@ -1,3 +1,6 @@
+import type { CopilotProfile } from "./profile";
+import { tokenFingerprint } from "./token";
+
 /**
  * ¿Hay que (re)enviar el perfil al servidor local de VS Code? Compartido por
  * el background de la extensión de navegador y por el userscript, que deciden
@@ -10,9 +13,28 @@ export interface SyncContext {
   readonly syncedTokenExp: number | null;
   /** `exp` del token guardado ahora. */
   readonly currentTokenExp: number | null;
+  /**
+   * Huellas (`tokenFingerprint`) del token que VS Code confirmó tener y del
+   * guardado ahora. Cuando vienen deciden ellas: un JWE no tiene `exp` con el
+   * que comparar, y sin esto se reenviaría cada vez.
+   */
+  readonly syncedTokenId?: string | null;
+  readonly currentTokenId?: string | null;
   readonly hasToken: boolean;
   readonly lastSyncAttemptAt: number | null;
   readonly now: number;
+}
+
+/**
+ * Clave estable de lo que se entrega a VS Code: la huella del perfil sin su
+ * sello temporal (`capturedAt` cambia en cada escritura del store aunque nada
+ * más cambie). Misma clave = VS Code ya tiene exactamente eso. Distingue una
+ * renovación de verdad (otro token) de la misma entrega repetida — un re-escaneo
+ * republica el perfil desde cada frame de la pestaña.
+ */
+export function deliveryKey(profile: CopilotProfile): string {
+  const { capturedAt: _capturedAt, ...stable } = profile;
+  return tokenFingerprint(JSON.stringify(stable));
 }
 
 /** No martillear al servidor local de VS Code cuando está apagado. */
@@ -33,6 +55,7 @@ export function needsResync(context: SyncContext): boolean {
     return false;
   }
   // Nunca se sincronizó, o lo que VS Code tiene es un token distinto (más viejo).
+  if (context.currentTokenId) return context.syncedTokenId !== context.currentTokenId;
   if (context.syncedTokenExp === null) return true;
   if (context.currentTokenExp === null) return true;
   return context.currentTokenExp > context.syncedTokenExp;

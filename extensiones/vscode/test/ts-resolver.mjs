@@ -14,6 +14,9 @@ export async function resolve(specifier, context, nextResolve) {
   try {
     return await nextResolve(specifier, context);
   } catch (error) {
+    // No VS Code host here: the stub with what profileBridge.mts needs.
+    if (specifier === "vscode")
+      return nextResolve(new URL("./vscode-stub.mjs", import.meta.url).href);
     const extensionless = specifier.startsWith(".") && !/\.[cm]?[jt]sx?$/i.test(specifier);
     if (!extensionless || error?.code !== "ERR_MODULE_NOT_FOUND") throw error;
     for (const candidate of CANDIDATES) {

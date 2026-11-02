@@ -9,10 +9,16 @@ export const en = {
   // ------------------------------------------------------------ profile (errors)
   "profile.error.empty": "Nothing was pasted.",
   "profile.error.notJwtOrJson":
-    "What you pasted is neither a JWT nor valid JSON. Use “Copy token” in the browser extension or the userscript.",
+    "What you pasted is neither a token (JWT or JWE) nor valid JSON. Use “Copy token” in the browser extension or the userscript, or paste the chat WebSocket URL (DevTools → Network, filter: chathub).",
   "profile.error.notObject": "The pasted JSON is not a profile object.",
   "profile.error.noToken": "The profile does not contain any accessToken.",
-  "profile.error.invalidJwt": "The accessToken does not look like a valid JWT.",
+  "profile.error.invalidJwt": "The accessToken does not look like a valid JWT or JWE.",
+  "profile.error.jweNeedsIdentity":
+    "That token is encrypted (a JWE, used by personal Microsoft accounts), so it does not say which account and tenant it belongs to — the {oid}@{tid} the chat connects to. " +
+    "Paste the whole chat WebSocket URL instead (DevTools → Network, filter: chathub → Copy URL: wss://substrate.office.com/m365Copilot/Chathub/{oid}@{tid}?access_token=…), " +
+    "or the profile JSON from the browser extension’s “Copy profile”.",
+  "profile.error.jweNeedsChatEndpoint":
+    "That personal-account (JWE) profile cannot connect yet: it lacks {0}. Paste the whole URL of the chat WebSocket that opened (DevTools → Network → WS, filter: chathub, the one with status 101 → Copy URL), or let the browser extension send the profile after one message at m365.cloud.microsoft.",
   "profile.error.urlWithoutToken":
     "That URL has no access_token. Copy the URL of the chat WebSocket (DevTools → Network, filter: chathub), which carries the token.",
 
@@ -34,6 +40,18 @@ export const en = {
   "client.error.401":
     "M365 Copilot did not accept your token: it has expired, or Microsoft revoked it early. Capture it again at " +
     "m365.cloud.microsoft and paste it with “M365 Copilot: Paste profile or token”.",
+  "client.error.401.unknownExpiry":
+    "M365 Copilot did not accept your session token. Personal-account tokens are encrypted, so their expiry cannot be read ahead of time: this usually means it expired. " +
+    "With the browser extension installed it is renewed on its own (keep m365.cloud.microsoft open); otherwise copy the chat WebSocket URL again and paste it with “M365 Copilot: Paste profile or token”.",
+  "client.error.noIdentity":
+    "The saved token is encrypted (a JWE, personal Microsoft account) and the profile does not say which account and tenant to connect to. " +
+    "Paste the chat WebSocket URL (DevTools → Network, filter: chathub) with “M365 Copilot: Paste profile or token”, or let the browser extension send the profile.",
+  "client.error.403.personal":
+    "M365 Copilot refused the connection for this personal Microsoft account (403 Forbidden). This is an authorization decision about the request, not an expired token, so renewing the token will not change it. " +
+    "The log has what the browser’s own chat connection asked for next to what was sent (“handshake”); share that (it never contains the token) to find the difference.",
+  "client.error.noChatEndpoint":
+    "The saved profile of this personal Microsoft account does not include the chat connection the browser opened (its WebSocket URL with the scenario and parameters it is entitled to), and inventing work-account values would be refused. " +
+    "Send one message at m365.cloud.microsoft with the browser extension installed, or paste that chat WebSocket URL (DevTools → Network → WS, filter: chathub) with “M365 Copilot: Paste profile or token”.",
   "client.error.403":
     "M365 Copilot did not let you in. Your account may not have a Copilot licence, or the captured token does not " +
     "work for the chat. Capture the profile again and retry.",
@@ -96,6 +114,9 @@ export const en = {
   "log.unexpectedResponse": "unexpected HTTP response while opening the WS: {0}",
   "log.header": "  header {0}: {1}",
   "log.body": "  response body: {0}",
+  "log.chatEndpoint": "  personal account chat endpoint: {0}",
+  "log.handshake": "  handshake, browser vs. this request: {0}",
+  "log.handshakeHeaders": "  handshake headers sent: {0}",
   "log.wsClosed": "WebSocket closed (code {0}{1})",
   "log.sendingInvocation": ">> sending chat invocation + Metrics",
   "log.chatFrame": ">> chat frame (full): {0}",
@@ -265,4 +286,5 @@ export const en = {
 
   // ------------------------------------------------------------ account
   "account.unknownUser": "M365 Copilot user",
+  "account.personalAccount": "Microsoft account (personal)",
 } satisfies Record<string, string>;

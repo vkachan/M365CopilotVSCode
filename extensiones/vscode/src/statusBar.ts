@@ -121,6 +121,8 @@ export class M365StatusBar implements CompletionBusySink, vscode.Disposable {
       lines.push(`$(account) ${t("statusbar.tooltip.account", profile.claims.upn)}`);
     if (!profile) {
       lines.push(`$(key) ${t("statusbar.tooltip.tokenMissing")}`);
+    } else if (!usable && profile.rejectedAt) {
+      lines.push(`$(warning) ${t("statusbar.tooltip.tokenRejected")}`);
     } else if (!usable) {
       lines.push(`$(warning) ${t("statusbar.tooltip.tokenExpired", Math.abs(minutes ?? 0))}`);
     } else {

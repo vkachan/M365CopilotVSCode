@@ -1,10 +1,13 @@
 import {
   TOKEN_SERVER_URL,
   TOKEN_ENDPOINT_PATH,
+  deliveryKey,
   HEALTH_ENDPOINT_PATH,
   SIGNOUT_ENDPOINT_PATH,
   isTokenUsable,
   profileFromCapture,
+  tokenExpiry,
+  tokenFingerprint,
   type CopilotProfile,
 } from "@m365copilot/core";
 import { ext } from "@/utils/api";
@@ -16,6 +19,7 @@ import {
   patchStorage,
   setStorage,
 } from "@/utils/storage";
+import { isAlreadyDelivered } from "@/utils/refreshPolicy";
 import { hardResetMicrosoftSession, type HardResetReport } from "@/utils/hardReset";
 import { logger } from "@/utils/logger";
 import { t } from "@/utils/i18n";
@@ -25,6 +29,7 @@ import {
   onTokenCaptured,
   runRefreshCycle,
   setupTokenRefresher,
+  type VSCodeVerdict,
 } from "@/utils/tokenRefresher";
 
 /** `syncState.lastError` when the stored token had already expired (not sent). */
@@ -70,7 +75,10 @@ export default defineBackground(() => {
       logger.info("Profile sent to VS Code successfully");
       await setStorage("lastSyncedAt", new Date().toISOString());
       await patchStorage("syncState", {
-        syncedTokenExp: profile.claims?.exp ?? null,
+        syncedTokenExp: tokenExpiry(profile),
+        // Un JWE no tiene `exp`: la huella es lo que dice qué token tiene VS Code.
+        syncedTokenId: tokenFingerprint(profile.accessToken),
+        syncedProfileKey: deliveryKey(profile),
         lastError: null,
       });
       return true;
@@ -84,6 +92,16 @@ export default defineBackground(() => {
     }
   }
 
+  /** ¿Es el token guardado el que VS Code dijo que M365 rechazó? */
+  async function isRejectedByVSCode(profile: any): Promise<boolean> {
+    const { rejectedTokenId } = await getStorage("syncState");
+    return (
+      Boolean(rejectedTokenId) &&
+      typeof profile?.accessToken === "string" &&
+      rejectedTokenId === tokenFingerprint(profile.accessToken)
+    );
+  }
+
   // ¿Está el servidor local de VS Code escuchando?
   async function isVSCodeReachable(): Promise<boolean> {
     return (await readHealth()) !== null;
@@ -94,6 +112,8 @@ export default defineBackground(() => {
     status?: string;
     /** Cierre de sesión pedido desde VS Code y todavía sin atender. */
     pendingSignOut?: { id?: string } | null;
+    /** Huella del token que M365 le rechazó a VS Code (401/403), o null. */
+    rejectedToken?: string | null;
   }
 
   async function readHealth(): Promise<Health | null> {
@@ -167,10 +187,16 @@ export default defineBackground(() => {
    * no llega a cargar — el navegador estaba cerrado, la web no responde —, el
    * cierre de sesión llega igual en el siguiente latido.
    */
-  async function pollSignOutRequest(): Promise<void> {
-    const id = await pendingSignOutId();
-    if (!id) return;
-    if ((await getStorage("handledSignOutId")) === id) return;
+  async function pollSignOutRequest(): Promise<VSCodeVerdict | void> {
+    const health = await readHealth();
+    // Sin VS Code escuchando no hay veredicto: no se da por bueno ni por malo.
+    if (!health) return;
+    const verdict: VSCodeVerdict = {
+      rejectedTokenId: typeof health.rejectedToken === "string" ? health.rejectedToken : null,
+    };
+    const id = health.pendingSignOut?.id;
+    if (typeof id !== "string" || !id) return verdict;
+    if ((await getStorage("handledSignOutId")) === id) return verdict;
     logger.info(`VS Code pide cerrar la sesión (${id}); atendiéndolo`);
     await hardReset({ requestId: id });
   }
@@ -194,6 +220,7 @@ export default defineBackground(() => {
         profile,
         lastSyncedAt: await getStorage("lastSyncedAt"),
         minutesLeft: describeMinutesLeft(profile),
+        tokenRejected: await isRejectedByVSCode(profile),
         refreshState: await getStorage("refreshState"),
         syncState: await getStorage("syncState"),
         autoOpenTab: await getStorage("autoOpenTab"),
@@ -227,6 +254,14 @@ export default defineBackground(() => {
 
       // Un único envío por actualización: antes esto lo hacía además un listener
       // de `chrome.storage.onChanged`, así que cada captura mandaba dos POST.
+      // Y sólo si cambió algo: un re-escaneo republica el mismo perfil desde
+      // cada frame de la pestaña, y cada copia era un POST (y un «token
+      // renovado» en VS Code) varias veces por segundo.
+      const { syncedProfileKey } = await getStorage("syncState");
+      if (isAlreadyDelivered(buildProfile(data), syncedProfileKey)) {
+        logger.debug("Perfil idéntico al que ya tiene VS Code: no se reenvía");
+        return { status: "ok" as const };
+      }
       await sendProfileToVSCode(data);
       return { status: "ok" as const };
     },

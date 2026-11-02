@@ -10,6 +10,7 @@
 import { WebSocketServer } from "ws";
 import assert from "node:assert/strict";
 import http from "node:http";
+import { randomBytes } from "node:crypto";
 import {
   streamCopilotTurn,
   streamCopilotTurnWithRetry,
@@ -45,8 +46,14 @@ import {
   type ThrottleChange,
   accountOf,
   foreignAudience,
+  isTokenUsable,
   looksLikeProfile,
+  minutesUntilExpiry,
+  onAuthRejected,
   parsePastedProfile,
+  ProfileParseError,
+  tokenFingerprint,
+  tokenFormat,
   M365_TOOL_NAMES,
   NEAR_OUTPUT_LIMIT_CHARS,
   OUTPUT_LIMIT_CHARS,
@@ -234,6 +241,37 @@ function fakeJwt(extra: Record<string, unknown> = {}): string {
     ...extra,
   };
   return `${b64url({ alg: "none", typ: "JWT" })}.${b64url(payload)}.sig`;
+}
+
+/** A synthetic compact JWE: a real header, random bytes for the rest (nothing to decrypt). */
+function fakeJwe(alg = "RSA-OAEP-256"): string {
+  const rand = (bytes: number) => randomBytes(bytes).toString("base64url");
+  const key = alg === "dir" ? "" : rand(256);
+  return `${b64url({ alg, enc: "A256GCM" })}.${key}.${rand(12)}.${rand(1600)}.${rand(16)}`;
+}
+
+const MSA_OID = "00000000-0000-0000-1234-56789abcdef0";
+const MSA_TID = "9188040d-6c67-4c5b-b112-36a304b66dad";
+function chathubUrl(token: string, query = "&source=officeweb&scenario=OfficeWebConsumerCopilot") {
+  return (
+    `wss://substrate.office.com/m365Copilot/Chathub/${MSA_OID}@${MSA_TID}` +
+    `?clientrequestid=c1&X-SessionId=s1&access_token=${token}${query}`
+  );
+}
+
+/** A personal-account profile pointed at the mock server (the endpointBase override). */
+function makeJweProfile(port: number): CopilotProfile {
+  return {
+    ...makeProfile(port),
+    accessToken: fakeJwe(),
+    claims: null,
+    endpoint: chathubUrl("old").replace(/access_token=old&?/, ""),
+    identity: {
+      oid: MSA_OID,
+      tid: MSA_TID,
+      endpointBase: "wss://substrate.office.com/m365Copilot/Chathub",
+    },
+  };
 }
 
 // ---- profile.ts ------------------------------------------------------------
@@ -6005,6 +6043,466 @@ async function testDeepDebugTraceOfATurn() {
   );
 }
 
+// ---- JWE (personal Microsoft accounts) --------------------------------------
+
+function testJweProfileImport() {
+  setLocale("en");
+  const token = fakeJwe();
+  assert.equal(tokenFormat(token), "jwe");
+  assert.equal(looksLikeProfile(token), true);
+  assert.equal(looksLikeProfile(`Bearer ${token}`), true);
+  assert.equal(looksLikeProfile(chathubUrl(token)), true);
+
+  // A bare JWE does not say whose it is: an actionable error, naming what is missing.
+  for (const pasted of [token, `Bearer ${token}`, `  ${fakeJwe("dir")}\n`]) {
+    assert.throws(
+      () => parsePastedProfile(pasted),
+      (error: unknown) =>
+        error instanceof ProfileParseError &&
+        /encrypted \(a JWE/.test(error.message) &&
+        /\{oid\}@\{tid\}/.test(error.message) &&
+        /Chathub/.test(error.message),
+    );
+  }
+
+  // The chat WebSocket URL copied from DevTools: token + identity + endpoint.
+  const fromUrl = parsePastedProfile(chathubUrl(token));
+  assert.equal(fromUrl.accessToken, token);
+  assert.equal(fromUrl.claims, null, "no claims are made up for an encrypted token");
+  assert.deepEqual(fromUrl.identity, {
+    oid: MSA_OID,
+    tid: MSA_TID,
+    endpointBase: "wss://substrate.office.com/m365Copilot/Chathub",
+  });
+  assert.doesNotMatch(fromUrl.endpoint ?? "", /access_token|X-SessionId|clientrequestid/);
+  assert.match(fromUrl.endpoint ?? "", /scenario=OfficeWebConsumerCopilot/);
+  assert.equal(minutesUntilExpiry(fromUrl), null, "expiry unknown, not invented");
+  assert.equal(isTokenUsable(fromUrl), true);
+  assert.equal(foreignAudience(token), null, "an encrypted audience is not a foreign one");
+  // https (Copy as URL) and an escaped `@` work too.
+  assert.equal(
+    parsePastedProfile(chathubUrl(token).replace(/^wss:/, "https:").replace("@", "%40")).identity
+      ?.tid,
+    MSA_TID,
+  );
+  // Not from Microsoft, or not over TLS: no identity to trust → the same error.
+  for (const url of [
+    chathubUrl(token).replace("substrate.office.com", "substrate.office.com.evil.example"),
+    chathubUrl(token).replace(/^wss:/, "ws:"),
+    `wss://substrate.office.com/m365Copilot/Chathub?access_token=${token}`,
+  ]) {
+    assert.throws(() => parsePastedProfile(url), /encrypted \(a JWE/);
+  }
+
+  // JSON profiles: what the browser extension sends / copies.
+  const json = parsePastedProfile(
+    JSON.stringify({
+      accessToken: token,
+      claims: { oid: "forged", exp: 9999999999 },
+      identity: fromUrl.identity,
+      expiresAt: Math.floor(Date.now() / 1000) + 1800,
+      endpoint: fromUrl.endpoint,
+      observedTones: ["Gpt_5_6_Reasoning"],
+    }),
+  );
+  assert.equal(json.claims, null, "claims in the JSON cannot be checked against a JWE: dropped");
+  assert.equal(json.identity?.oid, MSA_OID);
+  assert.equal(minutesUntilExpiry(json), 30, "MSAL's expiry, when the browser had it");
+  assert.deepEqual(json.observedTones, ["Gpt_5_6_Reasoning"]);
+  // Identity from the endpoint alone; a forged identity is re-validated and ignored.
+  assert.equal(
+    parsePastedProfile(JSON.stringify({ accessToken: token, endpoint: chathubUrl("x") })).identity
+      ?.oid,
+    MSA_OID,
+  );
+  assert.throws(
+    () =>
+      parsePastedProfile(
+        JSON.stringify({
+          accessToken: token,
+          identity: { ...fromUrl.identity, endpointBase: "wss://evil.example/Chathub" },
+        }),
+      ),
+    /encrypted \(a JWE/,
+  );
+  assert.throws(() => parsePastedProfile(JSON.stringify({ accessToken: token })), /encrypted/);
+  // An identity without the chat endpoint (or with another socket's) is not
+  // "ready": the same check the chat request makes, with what is missing.
+  assert.throws(
+    () => parsePastedProfile(JSON.stringify({ accessToken: token, identity: fromUrl.identity })),
+    (error: unknown) =>
+      error instanceof ProfileParseError &&
+      /cannot connect yet: it lacks endpoint/.test(error.message),
+  );
+  assert.throws(
+    () =>
+      parsePastedProfile(
+        JSON.stringify({
+          accessToken: token,
+          identity: fromUrl.identity,
+          endpoint: `wss://substrate.office.com/m365Copilot/Presence/${MSA_OID}@${MSA_TID}`,
+        }),
+      ),
+    /lacks endpoint \(not a Chathub URL/,
+  );
+  assert.throws(
+    () =>
+      parsePastedProfile(
+        JSON.stringify({
+          accessToken: token,
+          identity: fromUrl.identity,
+          endpoint: `wss://substrate.office.com/m365Copilot/Chathub/other@${MSA_TID}`,
+        }),
+      ),
+    /for another account/,
+  );
+  assert.equal(fromUrl.endpointConfirmed, true, "a pasted Chathub URL is the chat socket");
+  // A nonsense `expiresAt` is not kept; a JWT ignores it (its `exp` rules).
+  assert.equal(
+    parsePastedProfile(
+      JSON.stringify({
+        accessToken: token,
+        identity: fromUrl.identity,
+        endpoint: fromUrl.endpoint,
+        expiresAt: 42,
+      }),
+    ).expiresAt,
+    undefined,
+  );
+  assert.equal(
+    parsePastedProfile(JSON.stringify({ accessToken: fakeJwt(), expiresAt: 1900000000 })).expiresAt,
+    undefined,
+  );
+
+  // Malformed tokens are still refused, with the old messages.
+  for (const bad of ["a.b.c.d.e", `${token}.extra`, "eyJ.not.a.token!", "x".repeat(40)]) {
+    assert.throws(() => parsePastedProfile(bad), ProfileParseError, bad);
+  }
+  assert.throws(
+    () => parsePastedProfile(JSON.stringify({ accessToken: "a.b.c.d" })),
+    /neither|not look like a valid JWT or JWE/,
+  );
+
+  // JWT: unchanged — claims-based, an identity from the URL is just extra.
+  const jwtFromUrl = parsePastedProfile(
+    `wss://substrate.office.com/m365Copilot/Chathub/user-oid@tenant-tid?access_token=${fakeJwt()}`,
+  );
+  assert.equal(jwtFromUrl.claims?.oid, "user-oid");
+  assert.equal(jwtFromUrl.identity?.oid, "user-oid");
+  assert.equal(parsePastedProfile(fakeJwt()).identity, undefined);
+
+  // Accounts menu: the captured identity, labelled as a personal account.
+  assert.deepEqual(accountOf(fromUrl), {
+    sessionId: `${MSA_TID}/${MSA_OID}`,
+    accountId: MSA_OID,
+    label: "Microsoft account (personal)",
+  });
+  assert.equal(accountOf({ ...fromUrl, rejectedAt: new Date().toISOString() }), undefined);
+  setLocale("es");
+  console.log(
+    "  ✓ JWE: URL de Chathub, JSON con identidad, error claro si falta, claims nunca inventados",
+  );
+}
+
+function testJweLifecycleHelpers() {
+  const profile = parsePastedProfile(chathubUrl(fakeJwe()));
+  assert.equal(isTokenUsable(profile), true, "unknown expiry: usable until M365 says otherwise");
+  assert.equal(isTokenUsable({ ...profile, rejectedAt: "2026-11-02T10:00:00Z" }), false);
+  assert.equal(
+    isTokenUsable({ ...profile, expiresAt: Math.floor(Date.now() / 1000) - 10 }),
+    false,
+    "MSAL's expiry, when known, is honoured",
+  );
+  // JWT: unchanged.
+  assert.equal(isTokenUsable(parsePastedProfile(fakeJwt())), true);
+  assert.equal(
+    isTokenUsable(parsePastedProfile(fakeJwt({ exp: Math.floor(Date.now() / 1000) - 10 }))),
+    false,
+  );
+  const summary = describeProfile(profile)!;
+  assert.equal(summary.tokenFormat, "jwe");
+  assert.equal(summary.expirySource, "unknown");
+  assert.equal(summary.expiresAt, null);
+  assert.equal(summary.objectId, MSA_OID);
+  assert.ok(!JSON.stringify(summary).includes(profile.accessToken.slice(0, 40)));
+  assert.equal(describeProfile(parsePastedProfile(fakeJwt()))!.expirySource, "claims");
+  // What the web app's own socket asked for, for comparing after a refusal.
+  assert.equal(summary.endpointIsChathub, true);
+  assert.equal(
+    (summary.endpointParams as Record<string, string>).scenario,
+    "OfficeWebConsumerCopilot",
+  );
+  assert.equal(
+    (summary.endpointParams as Record<string, string>).path,
+    "/m365Copilot/Chathub/{oid}@{tid}",
+  );
+  console.log(
+    "  ✓ ciclo de vida: caducidad desconocida ≠ caducado; rechazo y caducidad de MSAL mandan",
+  );
+}
+
+/** One turn against the protocol mock; returns the connection it opened. */
+async function turnOn(
+  profile: CopilotProfile,
+  port: number,
+  connections: ProtocolConnection[],
+  tone: string | null = null,
+) {
+  let text = "";
+  await streamCopilotTurn({
+    profile,
+    endpointBase: mockBase(port),
+    prompt: "PROMPT",
+    tone,
+    signal: new AbortController().signal,
+    callbacks: { onText: (delta) => (text += delta) },
+  });
+  const connection = connections.at(-1)!;
+  const url = new URL(`http://x${connection.url}`);
+  return { text, url, query: url.searchParams, chat: chatArgsOf(connection) };
+}
+
+async function testJweWebSocketUrl() {
+  const server = await startProtocolServer((send) => {
+    send(botFrame({ text: "OK" }));
+    send(botFrame({ messageType: "EndOfRequest" }));
+  });
+  const withEndpoint = (query: string) => ({
+    ...makeJweProfile(server.port),
+    endpoint: chathubUrl("x", query).replace(/access_token=x&?/, ""),
+  });
+  try {
+    // JWT: built from the claims, as always — the captured endpoint is not replayed.
+    const jwtProfile = makeProfile(server.port);
+    const jwtTurn = await turnOn(jwtProfile, server.port, server.connections);
+    assert.equal(jwtTurn.text, "OK");
+    assert.equal(jwtTurn.url.pathname, "/m365Copilot/Chathub/o@t");
+    assert.equal(jwtTurn.query.get("access_token"), jwtProfile.accessToken);
+    assert.equal(jwtTurn.query.get("scenario"), "OfficeWebIncludedCopilot");
+    assert.equal(jwtTurn.query.get("source"), "officeweb");
+    assert.equal(jwtTurn.query.get("agentHost"), "Bizchat.FullScreen");
+
+    // JWE: the web app's own chat socket query, with this turn's ids and token
+    // — nothing of the work web app's (officeweb, Bizchat.FullScreen,
+    // OfficeWebIncludedCopilot) is added.
+    const profile = withEndpoint(
+      "&source=consumerweb&product=Office&scenario=OfficeWebConsumerCopilot&custom=1&variants=feature.a&ConversationId=stale",
+    );
+    const jweTurn = await turnOn(profile, server.port, server.connections);
+    assert.equal(jweTurn.text, "OK", "a JWE profile completes a turn");
+    assert.equal(jweTurn.url.pathname, `/m365Copilot/Chathub/${MSA_OID}@${MSA_TID}`);
+    assert.equal(
+      jweTurn.query.get("access_token"),
+      profile.accessToken,
+      "the JWE travels untouched",
+    );
+    assert.equal(jweTurn.query.get("scenario"), "OfficeWebConsumerCopilot");
+    assert.equal(jweTurn.query.get("source"), "consumerweb");
+    assert.equal(jweTurn.query.get("custom"), "1", "what the web app sent is kept");
+    assert.equal(jweTurn.query.get("agentHost"), null, "no work-app default added");
+    assert.equal(jweTurn.query.get("licenseType"), null);
+    assert.equal(jweTurn.query.get("variants"), null, "variants only on web turns, as for a JWT");
+    assert.equal(jweTurn.query.getAll("ConversationId").length, 1);
+    assert.notEqual(jweTurn.query.get("ConversationId"), "stale", "the web app's ids are replaced");
+    assert.equal(jweTurn.query.get("disableMemory"), "1");
+
+    // The web app's socket had no scenario: none is sent (not a work one).
+    const noScenario = await turnOn(
+      withEndpoint("&source=consumerweb"),
+      server.port,
+      server.connections,
+    );
+    assert.equal(noScenario.query.get("scenario"), null);
+    assert.equal(noScenario.query.get("product"), null);
+
+    // Models: Auto, Think Deeper and GPT-5.6 Think Deeper all go out with the JWE.
+    for (const [tone, wire] of [
+      [null, "magic"],
+      ["Reasoning", "Reasoning"],
+      ["Gpt_5_6_Reasoning", "Gpt_5_6_Reasoning"],
+    ] as const) {
+      const turn = await turnOn(makeJweProfile(server.port), server.port, server.connections, tone);
+      assert.equal(turn.chat.tone, wire, `tone ${tone}`);
+      assert.equal(turn.query.get("scenario"), "OfficeWebConsumerCopilot");
+    }
+    // A paid (work licence) selector cannot add a work licence to a personal account.
+    for (const endpointQuery of [
+      "&scenario=OfficeWebConsumerCopilot",
+      "&scenario=OfficeWebIncludedCopilot",
+    ]) {
+      const paid = await turnOn(
+        withEndpoint(endpointQuery),
+        server.port,
+        server.connections,
+        "Claude_Opus",
+      );
+      assert.notEqual(paid.query.get("scenario"), "OfficeWebPaidCopilot");
+      assert.equal(paid.query.get("licenseType"), null);
+    }
+
+    // Without the chat socket's URL (none, another socket, another account) nothing is sent.
+    setLocale("en");
+    const before = server.connections.length;
+    for (const endpoint of [
+      null,
+      `wss://substrate.office.com/m365Copilot/Presence/${MSA_OID}@${MSA_TID}?scenario=X`,
+      `wss://substrate.office.com/m365Copilot/Chathub/someone-else@${MSA_TID}?scenario=X`,
+      `wss://evil.example/m365Copilot/Chathub/${MSA_OID}@${MSA_TID}?scenario=X`,
+    ]) {
+      await assert.rejects(
+        turnOn({ ...makeJweProfile(server.port), endpoint }, server.port, server.connections),
+        (error: unknown) =>
+          error instanceof CopilotAuthError &&
+          /chat connection the browser opened/.test(error.message),
+        String(endpoint),
+      );
+    }
+    const orphan = { ...makeJweProfile(server.port), identity: undefined };
+    await assert.rejects(
+      turnOn(orphan, server.port, server.connections),
+      (error: unknown) =>
+        error instanceof CopilotAuthError && /which account and tenant/.test(error.message),
+    );
+    setLocale("es");
+    assert.equal(server.connections.length, before, "nothing was sent anywhere");
+  } finally {
+    server.close();
+  }
+  console.log(
+    "  ✓ URL del WebSocket: JWT desde sus claims; JWE replica el socket del chat de la web, sin valores de empresa",
+  );
+}
+
+/** Refuses every upgrade with `status`, with diagnostic headers like Substrate's. */
+function startRefusingServer(
+  status: number,
+): Promise<{ port: number; close: () => void; attempts: () => number }> {
+  return new Promise((resolve) => {
+    let attempts = 0;
+    const server = http.createServer((_req, res) => res.writeHead(status).end());
+    server.on("upgrade", (_req, socket) => {
+      attempts += 1;
+      const body = '{"error":"Forbidden","reason":"synthetic"}';
+      socket.write(
+        `HTTP/1.1 ${status} Refused\r\nConnection: close\r\nx-ms-diagnostics: 2000;reason="synthetic"\r\n` +
+          `x-ms-request-id: rid-1\r\nx-calculatedbetarget: be.example\r\nset-cookie: secret=1\r\n` +
+          `Content-Length: ${body.length}\r\n\r\n${body}`,
+      );
+      socket.destroy();
+    });
+    server.listen(0, () => {
+      const addr = server.address();
+      const port = typeof addr === "object" && addr ? addr.port : 0;
+      resolve({ port, close: () => server.close(), attempts: () => attempts });
+    });
+  });
+}
+
+async function testJweAuthRejection() {
+  const rejected: { token: string; status: number }[] = [];
+  onAuthRejected((token, status) => rejected.push({ token, status }));
+  setLocale("en");
+  const refuse = async (status: number, profile: CopilotProfile, port: number) => {
+    const lines: string[] = [];
+    let caught: unknown;
+    try {
+      await streamCopilotTurnWithRetry({
+        profile,
+        endpointBase: mockBase(port),
+        prompt: "PROMPT",
+        tone: null,
+        signal: new AbortController().signal,
+        callbacks: { onText: () => {} },
+        retryDelayMs: 1,
+        log: (line) => lines.push(line),
+      });
+    } catch (error) {
+      caught = error;
+    }
+    return { error: caught, log: lines.join("\n") };
+  };
+  const s401 = await startRefusingServer(401);
+  const s403 = await startRefusingServer(403);
+  try {
+    // 401: the token is no good — the expiry message, and the token is marked.
+    const profile = makeJweProfile(s401.port);
+    const r401 = await refuse(401, profile, s401.port);
+    assert.ok(r401.error instanceof CopilotAuthError);
+    assert.equal(r401.error.statusCode, 401);
+    assert.match(r401.error.message, /expiry cannot be read/);
+    assert.equal(s401.attempts(), 1, "an auth error is not retried");
+    assert.deepEqual(rejected, [{ token: profile.accessToken, status: 401 }]);
+
+    // 403: refused request, NOT an expired token — no marking, no renewal loop.
+    const forbidden = makeJweProfile(s403.port);
+    const r403 = await refuse(403, forbidden, s403.port);
+    assert.ok(r403.error instanceof CopilotAuthError);
+    assert.equal(r403.error.statusCode, 403);
+    assert.match(r403.error.message, /not an expired token/);
+    assert.equal(rejected.length, 1, "a 403 does not mark the token as rejected");
+    assert.equal(s403.attempts(), 1);
+    // The log shows the diagnostics and the handshake comparison, never the token or cookies.
+    assert.match(r403.log, /x-ms-diagnostics: 2000;reason="synthetic"/);
+    assert.match(r403.log, /x-calculatedbetarget: be\.example/);
+    assert.doesNotMatch(r403.log, /secret=1/);
+    assert.match(r403.log, /handshake, browser vs\. this request: .*"scenario":"same"/);
+    const handshake = r403.log.split("\n").find((line) => line.includes("handshake, browser"))!;
+    assert.doesNotMatch(handshake, /access_token|ConversationId/, "token and ids are not compared");
+    assert.match(handshake, /"path":"same"/);
+    assert.match(r403.log, /"disableMemory":\{"browser":"absent","ours":"1"\}/);
+    assert.match(r403.log, /handshake headers sent: .*Origin/);
+    for (const part of forbidden.accessToken.split(".").filter((p) => p.length > 20))
+      assert.ok(
+        !redactSecrets(r403.log).includes(part) && !r403.log.includes(part),
+        "token in the log",
+      );
+
+    // JWT: 401 marks as before; 403 keeps its old message and marks nothing.
+    const j401 = await refuse(401, makeProfile(s401.port), s401.port);
+    assert.ok(
+      j401.error instanceof CopilotAuthError && !/expiry cannot be read/.test(j401.error.message),
+    );
+    assert.equal(rejected.length, 2);
+    const j403 = await refuse(403, makeProfile(s403.port), s403.port);
+    assert.ok(
+      j403.error instanceof CopilotAuthError &&
+        !/personal Microsoft account/.test(j403.error.message),
+    );
+    assert.equal(rejected.length, 2);
+  } finally {
+    onAuthRejected(undefined);
+    setLocale("es");
+    s401.close();
+    s403.close();
+  }
+  console.log(
+    "  ✓ 401 marca el token; 403 no (no es caducidad) y deja en el log cabeceras y handshake comparado",
+  );
+}
+
+function testJweRedaction() {
+  const token = fakeJwe();
+  const direct = fakeJwe("dir");
+  const redacted = redactSecrets(
+    [
+      chathubUrl(token),
+      `bare ${token} token`,
+      `direct ${direct} key`,
+      `{"accessToken":"${token}"}`,
+      `Authorization: Bearer ${direct}`,
+    ].join("\n"),
+  );
+  for (const secret of [token, direct]) {
+    for (const part of secret.split(".").filter((p) => p.length > 20)) {
+      assert.ok(!redacted.includes(part), "a JWE segment survived the redaction");
+    }
+  }
+  assert.match(redacted, /<JWE \d+ chars>/);
+  assert.match(redacted, new RegExp(`${MSA_OID}@${MSA_TID}`), "the ids are not secrets");
+  assert.ok(tokenFingerprint(token).length < 24 && !token.includes(tokenFingerprint(token)));
+  console.log("  ✓ redactSecrets oculta también los JWE (con y sin clave cifrada)");
+}
+
 async function main() {
   // The assertions below were written against the Spanish catalog (the
   // extension's original language); the i18n tests switch locale themselves
@@ -6017,6 +6515,9 @@ async function main() {
   testPromptsFollowLocale();
   console.log("profile.ts");
   testProfileParsing();
+  testJweProfileImport();
+  testJweLifecycleHelpers();
+  testJweRedaction();
   console.log("markdown.ts");
   testMarkdownFormatting();
   console.log("toolProtocol.ts");
@@ -6038,6 +6539,8 @@ async function main() {
   await testCancellation();
   await test401FastFail();
   await testEndpointRotation();
+  await testJweWebSocketUrl();
+  await testJweAuthRejection();
   await testMultiMessageToolCall();
   await test429Retry();
   await testAuthErrorNotRetried();

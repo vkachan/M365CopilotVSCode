@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import { M365_CHAT_URL } from "@m365copilot/core";
-import { isTokenUsable, minutesUntilExpiry, debug } from "@m365copilot/core/bizchat";
+import { isTokenUsable, minutesUntilExpiry, tokenExpiry, debug } from "@m365copilot/core/bizchat";
 import type { ProfileStore } from "./secrets";
 import { t } from "./i18n";
 
@@ -30,6 +30,8 @@ export class TokenWatcher implements vscode.Disposable {
   /** `exp` of the token we already warned about, so each warning shows once per token. */
   private warnedSoonFor: number | undefined;
   private warnedExpiredFor: number | undefined;
+  /** `rejectedAt` of the token we already said M365 rejected. */
+  private warnedRejectedAt: string | undefined;
 
   constructor(
     private readonly store: ProfileStore,
@@ -58,8 +60,22 @@ export class TokenWatcher implements vscode.Disposable {
     this.lastUsable = usable;
     this.onTick();
 
-    const exp = profile?.claims?.exp;
-    if (!profile || exp === undefined || !notificationsEnabled()) return;
+    // Rejected by M365 while in use: the only expiry a JWE has, and worth
+    // saying even for a JWT (revoked early). Once per rejection.
+    if (
+      profile?.rejectedAt &&
+      wasUsable === true &&
+      this.warnedRejectedAt !== profile.rejectedAt &&
+      notificationsEnabled()
+    ) {
+      this.warnedRejectedAt = profile.rejectedAt;
+      debug("token", "notifying: M365 rejected the stored token");
+      void this.notify(t("watcher.rejected"), "warning");
+      return;
+    }
+
+    const exp = profile ? tokenExpiry(profile) : null;
+    if (!profile || exp === null || profile.rejectedAt || !notificationsEnabled()) return;
 
     if (!usable) {
       // Only an expiry seen happening in this session: a token that was

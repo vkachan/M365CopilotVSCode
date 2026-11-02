@@ -12,10 +12,16 @@ export const es: Record<keyof typeof en, string> = {
   // ------------------------------------------------------------ perfil (errores)
   "profile.error.empty": "No se pegó nada.",
   "profile.error.notJwtOrJson":
-    "Lo pegado no es ni un JWT ni un JSON válido. Usa «Copiar token» de la extensión de navegador o el userscript.",
+    "Lo pegado no es ni un token (JWT o JWE) ni un JSON válido. Usa «Copiar token» de la extensión de navegador o el userscript, o pega la URL del WebSocket del chat (DevTools → Red, filtro: chathub).",
   "profile.error.notObject": "El JSON pegado no es un objeto de perfil.",
   "profile.error.noToken": "El perfil no contiene ningún accessToken.",
-  "profile.error.invalidJwt": "El accessToken no parece un JWT válido.",
+  "profile.error.invalidJwt": "El accessToken no parece un JWT ni un JWE válido.",
+  "profile.error.jweNeedsIdentity":
+    "Ese token va cifrado (un JWE, el de las cuentas personales de Microsoft), así que no dice de qué cuenta e inquilino es — el {oid}@{tid} al que se conecta el chat. " +
+    "Pega en su lugar la URL completa del WebSocket del chat (DevTools → Red, filtro: chathub → Copiar URL: wss://substrate.office.com/m365Copilot/Chathub/{oid}@{tid}?access_token=…), " +
+    "o el JSON de «Copiar perfil» de la extensión de navegador.",
+  "profile.error.jweNeedsChatEndpoint":
+    "Ese perfil de cuenta personal (JWE) todavía no puede conectar: le falta {0}. Pega la URL completa del WebSocket del chat que se abrió (DevTools → Red → WS, filtro: chathub, el de estado 101 → Copiar URL), o deja que la extensión de navegador envíe el perfil tras un mensaje en m365.cloud.microsoft.",
   "profile.error.urlWithoutToken":
     "Esa URL no lleva access_token. Copia la URL del WebSocket del chat (DevTools → Red, filtro: chathub), que es la que lleva el token.",
 
@@ -38,6 +44,18 @@ export const es: Record<keyof typeof en, string> = {
   "client.error.401":
     "M365 Copilot ha rechazado tu token: ha caducado o Microsoft lo ha invalidado antes de tiempo. Vuelve a " +
     "capturarlo en m365.cloud.microsoft y pégalo con «M365 Copilot: Pegar perfil o token».",
+  "client.error.401.unknownExpiry":
+    "M365 Copilot no ha aceptado tu token de sesión. Los de las cuentas personales van cifrados y su caducidad no se puede leer de antemano: casi siempre significa que caducó. " +
+    "Con la extensión de navegador instalada se renueva solo (deja m365.cloud.microsoft abierto); si no, vuelve a copiar la URL del WebSocket del chat y pégala con «M365 Copilot: Pegar perfil o token».",
+  "client.error.noIdentity":
+    "El token guardado va cifrado (un JWE, cuenta personal de Microsoft) y el perfil no dice a qué cuenta e inquilino conectarse. " +
+    "Pega la URL del WebSocket del chat (DevTools → Red, filtro: chathub) con «M365 Copilot: Pegar perfil o token», o deja que la extensión de navegador envíe el perfil.",
+  "client.error.403.personal":
+    "M365 Copilot ha rechazado la conexión de esta cuenta personal de Microsoft (403 Forbidden). Es una decisión de autorización sobre la petición, no un token caducado: renovarlo no lo cambia. " +
+    "En el registro está lo que pidió la conexión del chat del propio navegador junto a lo que se envió («handshake»); compártelo (nunca lleva el token) para encontrar la diferencia.",
+  "client.error.noChatEndpoint":
+    "El perfil guardado de esta cuenta personal de Microsoft no incluye la conexión del chat que abrió el navegador (su URL de WebSocket con el escenario y los parámetros a los que tiene derecho), e inventar los de una cuenta de empresa sería rechazado. " +
+    "Envía un mensaje en m365.cloud.microsoft con la extensión de navegador instalada, o pega esa URL del WebSocket del chat (DevTools → Red → WS, filtro: chathub) con «M365 Copilot: Pegar perfil o token».",
   "client.error.403":
     "M365 Copilot no te ha dejado entrar. Puede que tu cuenta no tenga licencia de Copilot o que el token capturado " +
     "no sirva para el chat. Vuelve a capturar el perfil e inténtalo de nuevo.",
@@ -105,6 +123,9 @@ export const es: Record<keyof typeof en, string> = {
   "log.unexpectedResponse": "respuesta HTTP inesperada al abrir el WS: {0}",
   "log.header": "  cabecera {0}: {1}",
   "log.body": "  cuerpo de la respuesta: {0}",
+  "log.chatEndpoint": "  endpoint del chat de la cuenta personal: {0}",
+  "log.handshake": "  handshake, navegador frente a esta petición: {0}",
+  "log.handshakeHeaders": "  cabeceras del handshake enviadas: {0}",
   "log.wsClosed": "WebSocket cerrado (código {0}{1})",
   "log.sendingInvocation": ">> enviando invocación chat + Metrics",
   "log.chatFrame": ">> chat frame (completo): {0}",
@@ -279,4 +300,5 @@ export const es: Record<keyof typeof en, string> = {
 
   // ------------------------------------------------------------ cuenta
   "account.unknownUser": "Usuario de M365 Copilot",
+  "account.personalAccount": "Cuenta de Microsoft (personal)",
 };

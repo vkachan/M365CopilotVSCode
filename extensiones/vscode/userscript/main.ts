@@ -24,22 +24,26 @@ import {
   TOKEN_ENDPOINT_PATH,
   TOKEN_SERVER_URL,
   acceptToken,
-  areClaimsUsable,
   connectionArtSvg,
   connectionState,
   inspectOutgoingFrames,
+  isCaptureUsable,
   isCopilotSocketUrl,
   needsResync,
   nextScan,
   normalizeEndpoint,
   profileFromCapture,
   sameCapture,
+  shouldStoreTentativeEndpoint,
+  tokenCandidatesInStorageValue,
+  tokenExpiry,
+  tokenFingerprint,
   tokenInSocketUrl,
-  tokensInStorageValue,
   toneOfTemplate,
   withObservedTone,
   withoutExpiredToken,
   type CaptureStore,
+  type TokenOrigin,
 } from "@m365copilot/core";
 
 const SYNC_KEY = "m365copilot.sync.v1";
@@ -54,6 +58,8 @@ const MIN_PAGE_AGE_MS = 2 * 60_000;
 interface SyncState {
   /** `exp` of the token VS Code confirmed it received. */
   syncedTokenExp: number | null;
+  /** Its fingerprint: what tells tokens apart when the expiry is unknown (JWE). */
+  syncedTokenId: string | null;
   lastSyncAttemptAt: number | null;
   lastSyncedAt: number | null;
   lastError: string | null;
@@ -71,6 +77,7 @@ interface UiState {
 
 const EMPTY_SYNC: SyncState = {
   syncedTokenExp: null,
+  syncedTokenId: null,
   lastSyncAttemptAt: null,
   lastSyncedAt: null,
   lastError: null,
@@ -211,10 +218,15 @@ function pruneExpiredToken(): void {
   GM_setValue(CAPTURE_STORE_KEY, JSON.stringify(cleaned));
 }
 
-function offerToken(token: string | null, source: string): void {
+/** Expiry of the stored token: its `exp`, MSAL's for a JWE, or null when unknown. */
+const storeExpiry = (store: CaptureStore) =>
+  tokenExpiry({ claims: store.claims ?? null, expiresAt: store.expiresAt });
+
+/** `origin` is what lets an encrypted token (JWE) in: see TokenOrigin in capture.ts. */
+function offerToken(token: string | null, source: string, origin: TokenOrigin): void {
   if (!token) return;
   try {
-    const accepted = acceptToken(readStore(), token);
+    const accepted = acceptToken(readStore(), token, Date.now(), origin);
     if (!accepted) return;
     writeStore({ ...accepted, tokenSource: source });
     if (IS_TOP) void syncToVSCode(hasUnsentChanges());
@@ -228,12 +240,12 @@ function offerToken(token: string | null, source: string): void {
 function captureSocket(url: unknown, socket: WebSocket): void {
   const raw = String(url);
   if (!isCopilotSocketUrl(raw)) return;
-  offerToken(tokenInSocketUrl(raw), "websocket-url");
+  offerToken(tokenInSocketUrl(raw), "websocket-url", { kind: "socket", url: raw });
 
   // Substrate opens several sockets (presence, notifications…): keep this one
   // only tentatively, until it sends a `chat` frame — the proof it is the hub.
   const endpoint = normalizeEndpoint(raw);
-  if (endpoint && !readStore().endpointConfirmed) {
+  if (shouldStoreTentativeEndpoint(readStore(), endpoint)) {
     writeStore({ endpoint, origin: location.origin, userAgent: navigator.userAgent });
   }
 
@@ -280,7 +292,7 @@ function headerValue(headers: unknown, name: string): string | null {
 }
 
 function offerBearer(value: string | null, source: string): void {
-  if (value && /^bearer /i.test(value)) offerToken(value.slice(7), source);
+  if (value && /^bearer /i.test(value)) offerToken(value.slice(7), source, { kind: "header" });
 }
 
 function installHooks(): void {
@@ -348,8 +360,8 @@ function scanStorages(): void {
       try {
         const key = store.key(index);
         if (!key || key === CAPTURE_STORE_KEY) continue;
-        for (const token of tokensInStorageValue(store.getItem(key)))
-          offerToken(token, "msal-cache");
+        for (const { token, entry } of tokenCandidatesInStorageValue(store.getItem(key)))
+          offerToken(token, "msal-cache", { kind: "storage", entry });
       } catch {
         /* unreadable entry: next one */
       }
@@ -386,13 +398,12 @@ let syncing = false;
  * which only exists not to hammer a VS Code that is not running.
  */
 function hasUnsentToken(): boolean {
-  const exp = readStore().claims?.exp;
+  const store = readStore();
+  const exp = storeExpiry(store);
   const sync = readSync();
-  return (
-    typeof exp === "number" &&
-    (sync.syncedTokenExp === null || exp > sync.syncedTokenExp) &&
-    sync.vscodeReachable !== false
-  );
+  if (!store.accessToken || sync.vscodeReachable === false) return false;
+  if (exp === null) return sync.syncedTokenId !== tokenFingerprint(store.accessToken);
+  return sync.syncedTokenExp === null || exp > sync.syncedTokenExp;
 }
 
 /**
@@ -418,7 +429,7 @@ const hasUnsentChanges = () => hasUnsentToken() || hasUnsentTone();
 async function syncToVSCode(force = false): Promise<boolean> {
   const store = readStore();
   const profile = profileFromCapture(store, navigator.userAgent);
-  if (!profile || !areClaimsUsable(store.claims) || syncing) return false;
+  if (!profile || !isCaptureUsable(store) || syncing) return false;
   const sync = readSync();
   const now = Date.now();
   if (
@@ -426,7 +437,9 @@ async function syncToVSCode(force = false): Promise<boolean> {
     !needsResync({
       capturedAt: store.capturedAt ?? null,
       syncedTokenExp: sync.syncedTokenExp,
-      currentTokenExp: store.claims?.exp ?? null,
+      currentTokenExp: storeExpiry(store),
+      syncedTokenId: sync.syncedTokenId ?? null,
+      currentTokenId: storeExpiry(store) === null ? tokenFingerprint(profile.accessToken) : null,
       hasToken: true,
       lastSyncAttemptAt: sync.lastSyncAttemptAt,
       now,
@@ -441,7 +454,8 @@ async function syncToVSCode(force = false): Promise<boolean> {
     const status = await request("POST", TOKEN_ENDPOINT_PATH, JSON.stringify(profile));
     if (status >= 200 && status < 300) {
       writeSync({
-        syncedTokenExp: store.claims?.exp ?? null,
+        syncedTokenExp: storeExpiry(store),
+        syncedTokenId: tokenFingerprint(profile.accessToken),
         syncedTones: profile.observedTones ?? [],
         lastSyncedAt: Date.now(),
         lastError: null,
@@ -478,7 +492,7 @@ function maybeReloadToRenew(): void {
   if (!IS_TOP || !readUi().autoReload || document.visibilityState !== "hidden") return;
   const store = readStore();
   const hadSession = Boolean(store.endpoint || store.invocationTemplate);
-  const expired = !store.accessToken || !areClaimsUsable(store.claims);
+  const expired = !isCaptureUsable(store);
   if (!hadSession || !expired || Date.now() - LOADED_AT < MIN_PAGE_AGE_MS) return;
   const { lastReloadAt } = readSync();
   if (lastReloadAt && Date.now() - lastReloadAt < RELOAD_EVERY_MS) return;
@@ -631,7 +645,7 @@ function mountUi(): void {
     const store = readStore();
     const sync = readSync();
     const hasToken = Boolean(store.accessToken);
-    const usable = hasToken && areClaimsUsable(store.claims);
+    const usable = hasToken && isCaptureUsable(store);
     const state = connectionState({
       hasToken,
       expired: hasToken && !usable,
@@ -654,8 +668,8 @@ function mountUi(): void {
     q<HTMLElement>(".status-title").toggleAttribute("data-busy", state === "waiting");
     q(".status-sub").textContent = sub;
 
-    const exp = store.claims?.exp;
-    const minutes = typeof exp === "number" ? Math.round((exp * 1000 - Date.now()) / 60000) : null;
+    const exp = storeExpiry(store);
+    const minutes = exp !== null ? Math.round((exp * 1000 - Date.now()) / 60000) : null;
     q('[data-value="token"]').textContent = !hasToken
       ? T.tokenNone
       : !usable

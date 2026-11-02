@@ -8,7 +8,14 @@ import {
   TOKEN_SERVER_PORT,
   type SignOutReport,
 } from "@m365copilot/core";
-import { type CopilotProfile, debug, isDeepDebug, log } from "@m365copilot/core/bizchat";
+import {
+  type CopilotProfile,
+  debug,
+  isDeepDebug,
+  log,
+  tokenExpiry,
+  tokenFingerprint,
+} from "@m365copilot/core/bizchat";
 import type { ProfileStore } from "./secrets";
 import { t } from "./i18n";
 
@@ -213,12 +220,26 @@ export class TokenAutoRefreshServer implements vscode.Disposable {
               respond(res, 200, { success: true, id: outcome.id });
               return;
             }
-            const profile = await this.store.setFromPaste(body);
-            log(t("log.server.renewed"));
-            this.onTokenReceived?.(profile);
+            const { profile, tokenChanged, changed } = await this.store.receive(body);
+            // "Renewed" only for another token: the browser also delivers the
+            // same one again (a re-scan, a model seen, VS Code restarting).
+            if (tokenChanged) {
+              log(t("log.server.renewed"));
+              this.onTokenReceived?.(profile);
+            } else {
+              debug(
+                traces.get(res)?.scope ?? "http",
+                changed
+                  ? "same token delivered again, with other profile changes (stored, not a renewal)"
+                  : "same profile delivered again (ignored)",
+              );
+            }
             respond(res, 200, {
               success: true,
-              expiresAt: profile.claims?.exp,
+              tokenChanged,
+              unchanged: !changed,
+              // null for a JWE: its expiry is unknown, not invented.
+              expiresAt: tokenExpiry(profile),
               user: profile.claims?.upn,
             });
           } catch (error) {
@@ -234,10 +255,15 @@ export class TokenAutoRefreshServer implements vscode.Disposable {
       // está activo. Lleva además el cierre de sesión pendiente, si hay
       // alguno: es el único canal de ida hacia el navegador.
       if (req.method === "GET" && req.url === HEALTH_ENDPOINT_PATH) {
+        // The token M365 refused, as a fingerprint (never the token): the
+        // browser extension renews when it is the one it holds — the only
+        // expiry signal a JWE has.
+        const stored = await this.store.get();
         respond(res, 200, {
           status: "ok",
           service: "m365-copilot-vscode",
           pendingSignOut: this.pendingSignOut,
+          rejectedToken: stored?.rejectedAt ? tokenFingerprint(stored.accessToken) : null,
         });
         return;
       }

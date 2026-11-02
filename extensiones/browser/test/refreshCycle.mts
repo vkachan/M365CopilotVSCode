@@ -106,8 +106,29 @@ function profileExpiringIn(minutes: number) {
 
 // Los módulos leen `chrome` al ejecutarse, así que el stub va antes del import.
 installFakeChrome();
-const { runRefreshCycle, onTokenCaptured, setSyncHandler, setupTokenRefresher } =
-  await import("../utils/tokenRefresher.ts");
+const {
+  runRefreshCycle,
+  onTokenCaptured,
+  setSignOutPoll,
+  setSyncHandler,
+  setupTokenRefresher,
+  describeMinutesLeft,
+} = await import("../utils/tokenRefresher.ts");
+const { tokenFingerprint } = await import("@m365copilot/core");
+
+/** Perfil de una cuenta personal: JWE opaco, identidad del socket, sin caducidad. */
+function jweProfile(token = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..iv.ciphertext.tag") {
+  return {
+    accessToken: token,
+    capturedAt: new Date().toISOString(),
+    claims: null,
+    identity: {
+      oid: "o",
+      tid: "t",
+      endpointBase: "wss://substrate.office.com/m365Copilot/Chathub",
+    },
+  };
+}
 const { getStorage, setStorage } = await import("../utils/storage.ts");
 
 const M365_TAB: FakeTab = { id: 7, url: "https://m365.cloud.microsoft/chat/" };
@@ -217,10 +238,96 @@ async function testSurvivesMissingAlarmsPermission() {
   console.log('  ✓ sin el permiso "alarms" avisa, pero no tumba el background');
 }
 
+async function testJweUnknownExpiry() {
+  const { calls } = installFakeChrome({ tabs: [M365_TAB] });
+  setSignOutPoll(async () => ({ rejectedTokenId: null }));
+  let sends = 0;
+  setSyncHandler(async (profile: any) => {
+    sends += 1;
+    // Lo que anota el envío real (background.ts).
+    await setStorage("syncState", {
+      ...(await getStorage("syncState")),
+      syncedTokenExp: null,
+      syncedTokenId: tokenFingerprint(profile.accessToken),
+      lastSyncAttemptAt: Date.now() - 60_000,
+    });
+    return true;
+  });
+  await seed(jweProfile());
+
+  // Sin caducidad conocida: ni re-escaneo ni recarga, y se envía una sola vez.
+  for (let i = 0; i < 3; i++) assert.equal((await runRefreshCycle()).action, "none");
+  assert.equal(sends, 1, "un JWE no se reenvía en cada latido");
+  assert.deepEqual(calls.messages, []);
+  assert.deepEqual(calls.reloaded, []);
+  assert.equal(describeMinutesLeft(jweProfile()), null);
+
+  // Token nuevo (otro socket): se envía ese.
+  await seed(jweProfile("eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..iv.renewed.tag"));
+  await runRefreshCycle();
+  assert.equal(sends, 2);
+  console.log("  ✓ JWE sin caducidad: no se renueva a ciegas y se sincroniza una vez por token");
+}
+
+async function testJweRejectedByVSCode() {
+  const { calls } = installFakeChrome({ tabs: [M365_TAB] });
+  const profile = jweProfile();
+  let sends = 0;
+  setSyncHandler(async () => {
+    sends += 1;
+    return true;
+  });
+  await seed(profile, {
+    syncState: {
+      syncedTokenExp: null,
+      syncedTokenId: tokenFingerprint(profile.accessToken),
+      rejectedTokenId: null,
+      lastSyncAttemptAt: null,
+      lastError: null,
+    },
+  });
+  // VS Code dice en su health-check que M365 rechazó ESTE token.
+  setSignOutPoll(async () => ({ rejectedTokenId: tokenFingerprint(profile.accessToken) }));
+
+  assert.equal((await runRefreshCycle()).action, "rescan");
+  assert.deepEqual(calls.messages, [{ tabId: 7, type: "RESCAN_TOKEN" }]);
+  assert.equal(sends, 0, "el token rechazado no se vuelve a mandar");
+  assert.equal(
+    (await getStorage("syncState")).rejectedTokenId,
+    tokenFingerprint(profile.accessToken),
+    "el popup lo ve como «renovando»",
+  );
+  // Sin token nuevo tras el backoff: recarga la pestaña para que la web abra otro socket.
+  const state = await getStorage("refreshState");
+  await setStorage("refreshState", { ...state, lastAttemptAt: Date.now() - 5 * 60_000 });
+  assert.equal((await runRefreshCycle()).action, "reload");
+  assert.deepEqual(calls.reloaded, [7]);
+
+  // Llega uno nuevo: el veredicto ya no es sobre él, todo vuelve a la calma.
+  const renewed = jweProfile("eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIn0..iv.renewed.tag");
+  await onTokenCaptured(renewed);
+  await seed(renewed);
+  assert.equal((await runRefreshCycle()).action, "none");
+  assert.equal(sends, 1, "el token renovado sí se envía");
+
+  // Un rechazo de otro token (huella distinta) no dispara nada.
+  setSignOutPoll(async () => ({ rejectedTokenId: "otro.1" }));
+  assert.equal((await runRefreshCycle()).action, "none");
+  // Y con VS Code apagado (sin veredicto) se recuerda el último que dio.
+  setSignOutPoll(async () => undefined);
+  assert.equal((await runRefreshCycle()).action, "none");
+  setSignOutPoll(async () => {});
+  console.log(
+    "  ✓ JWE rechazado por M365 (veredicto de VS Code): re-escaneo → recarga, sin reenviarlo",
+  );
+}
+
 console.log("tokenRefresher.ts (ciclo completo)");
 await testHealthyTokenSyncsOnce();
 await testResyncIsNotRepeated();
 await testEscalationOverCycles();
 await testOpensAndClosesItsOwnTab();
 await testSurvivesMissingAlarmsPermission();
+await testJweUnknownExpiry();
+await testJweRejectedByVSCode();
 console.log("\nAll tests passed.");

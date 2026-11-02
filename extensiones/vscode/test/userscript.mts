@@ -311,7 +311,45 @@ async function testFramesAndMenu() {
   );
 }
 
+async function testPersonalAccountJwe() {
+  const page = load();
+  const part = (bytes: number) =>
+    Buffer.from(crypto.getRandomValues(new Uint8Array(bytes))).toString("base64url");
+  const header = Buffer.from(JSON.stringify({ alg: "RSA-OAEP-256", enc: "A256GCM" })).toString(
+    "base64url",
+  );
+  const jwe = () => `${header}.${part(256)}.${part(12)}.${part(1200)}.${part(16)}`;
+  const oid = "00000000-0000-0000-1234-56789abcdef0";
+  const tid = "9188040d-6c67-4c5b-b112-36a304b66dad";
+  const url = (token: string) =>
+    `wss://substrate.office.com/m365Copilot/Chathub/${oid}@${tid}?access_token=${token}&scenario=OfficeWebConsumerCopilot`;
+  const token = jwe();
+  page.openSocket(url(token));
+  await settle();
+  assert.equal(page.capture().accessToken, token, "the encrypted token of the chat socket");
+  assert.equal(page.capture().identity.oid, oid);
+  const [post] = page.posts();
+  const profile = JSON.parse(post!.data!);
+  assert.equal(profile.accessToken, token);
+  assert.equal(profile.claims, null);
+  assert.equal(profile.identity.tid, tid);
+  assert.equal(page.sync().syncedTokenExp, null, "no expiry is invented");
+  assert.ok(page.sync().syncedTokenId, "the fingerprint tells tokens apart instead");
+
+  // The same JWE again sends nothing; a renewed one is sent.
+  page.openSocket(url(token));
+  await settle();
+  assert.equal(page.posts().length, 1);
+  page.openSocket(url(jwe()));
+  await settle();
+  assert.equal(page.posts().length, 2);
+  console.log(
+    "  ✓ personal account: the chat socket's JWE is captured with its identity and sent once",
+  );
+}
+
 await testWebSocketCaptureAndSync();
+await testPersonalAccountJwe();
 await testMsalCacheAndRenewal();
 await testHeadersAndVsCodeDown();
 await testFramesAndMenu();
